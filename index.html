@@ -108,6 +108,13 @@
   .checkline:last-child { border-bottom: 0; }
   .checkline .done-text { text-decoration: line-through; color: var(--muted); }
   .checkline input[type="checkbox"] { width: 20px; height: 20px; }
+  .memo-clamp {
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; word-break: break-word;
+  }
+  .memo-clamp.open { display: block; }
+  .memo-toggle { font-size: 13px; font-weight: 600; color: var(--brand); text-decoration: none; }
+  .memo-src a { color: var(--brand); font-weight: 600; text-decoration: none; }
 </style>
 </head>
 <body>
@@ -382,6 +389,43 @@ const $ = id => document.getElementById(id);
 const fmt = n => (Math.round(Number(n) || 0)).toLocaleString('ko-KR') + '원';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// URL 호스트로 출처 플랫폼명을 판별한다.
+function platformName(url) {
+  let host = '';
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { return '링크'; }
+  if (host === 'instagram.com' || host.endsWith('.instagram.com')) return 'Instagram';
+  if (host === 'blog.naver.com' || host === 'm.blog.naver.com') return '네이버 블로그';
+  if (host === 'youtube.com' || host.endsWith('.youtube.com') || host === 'youtu.be') return 'YouTube';
+  return '링크';
+}
+
+// 메모 표시용 HTML.
+// - 메모에 URL이 있으면 출처를 "출처: 플랫폼 ↗" 링크로 짧게 표시하고,
+//   URL과 기존 "출처: (제목)" 접두 부분은 본문에서 제거한다.
+//   (링크 수집함의 옛 메모는 캡션 전문이 제목 자리에 통째로 들어 있어,
+//    접두 부분을 제거하면 출처 칩만 남는다.)
+// - 남은 본문이 길면 기본 3줄만 보여주고 더보기/접기로 펼칠 수 있게 한다.
+function memoHtml(text) {
+  const t = String(text ?? '');
+  if (!t.trim()) return '';
+  let rest = t;
+  let chip = '';
+  const m = t.match(/https?:\/\/[^\s"')\]]+/);
+  if (m) {
+    const url = m[0];
+    const before = t.slice(0, m.index).trim();
+    const after = t.slice(m.index + url.length).trim();
+    // URL 앞부분이 "출처:"로 시작하면 제목까지가 출처 표기이므로 본문에서 제외
+    rest = /^출처\s*:/.test(before) ? after : [before, after].filter(Boolean).join(' ');
+    chip = `<div class="muted memo-src">출처: <a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(platformName(url))} ↗</a></div>`;
+  }
+  const body = rest.trim();
+  if (!body) return chip;
+  const needsToggle = body.length > 80 || body.split('\n').length > 3;
+  if (!needsToggle) return chip + `<div class="muted">${esc(body)}</div>`;
+  return chip + `<div class="muted memo-clamp">${esc(body)}</div><a href="#" class="memo-toggle">더보기</a>`;
+}
 
 function showError(msg) {
   const box = $('errorBox');
@@ -720,7 +764,7 @@ function renderPlaces() {
       <div class="item-line" style="border:0;padding:0">
         <div class="item-main">
           <div class="item-title"><span class="chip">${esc(p.category)}</span>${esc(p.name)}</div>
-          <div class="muted">${esc(p.memo || '')}</div>
+          ${memoHtml(p.memo)}
         </div>
         <button class="danger small" data-del-place="${p.id}">삭제</button>
       </div>
@@ -733,6 +777,15 @@ function renderPlaces() {
     b.onclick = async () => {
       await sb.from('saved_places').delete().eq('id', b.dataset.delPlace);
       await loadTripData();
+    };
+  });
+  box.querySelectorAll('.memo-toggle').forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const memoEl = a.previousElementSibling;
+      if (!memoEl) return;
+      const open = memoEl.classList.toggle('open');
+      a.textContent = open ? '접기' : '더보기';
     };
   });
   box.querySelectorAll('[data-place-add]').forEach(b => {
@@ -842,7 +895,9 @@ async function addSelectedCandidates() {
   const checked = [...document.querySelectorAll('[data-cand]')].filter(c => c.checked);
   if (!checked.length) { showError('넣을 장소를 하나 이상 골라 주세요.'); return; }
   showError('');
-  const memo = `출처: ${linkInbox.title} ${linkInbox.url}`;
+  // 출처는 짧게 저장한다: 플랫폼명 + URL만 (제목/캡션 전문은 넣지 않음).
+  // 장소 카드에서는 이 URL로 "출처: 플랫폼 ↗" 링크를 만들어 보여준다.
+  const memo = `출처: ${platformName(linkInbox.url)} ${linkInbox.url}`;
   const rows = checked.map(c => ({
     trip_id: state.trip.id,
     name: linkInbox.candidates[Number(c.dataset.cand)].name,
