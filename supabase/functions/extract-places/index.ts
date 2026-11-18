@@ -28,6 +28,12 @@ const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+// 인스타그램 전용 UA: 일반 브라우저 UA로는 로그인 벽/체크포인트
+// 페이지만 돌아오지만, 링크 미리보기 크롤러 UA로는 og 메타와
+// 임베드 페이지(캡션 전문)를 로그인 없이 받을 수 있다.
+const CRAWLER_UA =
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)";
+
 // === EXTRACT LOGIC START ===
 // 아래 구간은 순수 JS(타입 표기 없음)입니다. Node 테스트에서 그대로
 // 추출해 실행할 수 있게 유지하세요.
@@ -382,7 +388,11 @@ async function readBodyWithCap(
 // - 리다이렉트는 자동 추종(redirect: "follow")을 쓰지 않고 최대
 //   MAX_REDIRECTS회까지 직접 따라간다.
 // - 전체 시간(timeoutMs)과 응답 크기(MAX_BODY_BYTES)에 상한이 있다.
-async function fetchText(rawUrl: string, timeoutMs = 10000): Promise<string> {
+async function fetchText(
+  rawUrl: string,
+  timeoutMs = 10000,
+  userAgent: string = BROWSER_UA,
+): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -392,7 +402,7 @@ async function fetchText(rawUrl: string, timeoutMs = 10000): Promise<string> {
       if (!gate.ok) throw new BlockedUrlError(gate.reason);
       const res = await fetch(gate.url.toString(), {
         headers: {
-          "User-Agent": BROWSER_UA,
+          "User-Agent": userAgent,
           "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
           Accept: "text/html,application/xhtml+xml",
         },
@@ -420,7 +430,13 @@ async function fetchText(rawUrl: string, timeoutMs = 10000): Promise<string> {
 }
 
 type ExtractResult =
-  | { ok: true; title: string; candidates: { name: string }[]; source: string }
+  | {
+    ok: true;
+    title: string;
+    candidates: { name: string }[];
+    source: string;
+    source_detail?: string;
+  }
   | { ok: false; reason: string };
 
 async function extractNaverBlog(url: URL): Promise<ExtractResult> {
@@ -526,32 +542,140 @@ async function extractYouTube(url: URL): Promise<ExtractResult> {
   };
 }
 
-async function extractGeneric(url: URL): Promise<ExtractResult> {
-  const isInstagram = /(^|\.)instagram\.com$/.test(url.hostname);
-  const html = await fetchText(url.toString());
-  const title = metaContent(html, "og:title");
-  let description = metaContent(html, "og:description");
-  const bodyText = htmlToText(html);
+// 인스타그램 URL에서 게시물 종류와 숏코드를 뽑는다.
+// /reel/{code}/, /reels/{code}/, /p/{code}/, /tv/{code}/ 와
+// /{username}/reel/{code}/ 형태를 모두 인식한다.
+function parseInstagramTarget(
+  url: URL,
+): { seg: string; code: string } | null {
+  const m = url.pathname.match(/\/(reel|reels|p|tv)\/([A-Za-z0-9_-]+)/);
+  if (!m) return null;
+  return { seg: m[1] === "reels" ? "reel" : m[1], code: m[2] };
+}
 
-  if (isInstagram) {
-    // og:description 안에 캡션이 따옴표로 들어오는 경우가 있다
-    const cap = description.match(/["“]([^"”]{10,300})["”]/);
-    const caption = cap ? cap[1] : "";
-    const genericTitle = !title || title.trim() === "Instagram";
-    if (genericTitle && !caption) {
-      return {
-        ok: false,
-        reason:
-          "인스타그램이 로그인 벽으로 막아서 게시물 내용을 읽지 못했어요. 장소는 아래에서 직접 입력해 주세요.",
-      };
+// 임베드 페이지 HTML에서 캡션 전문, 계정명, 위치 태그를 뽑는다.
+// 임베드에는 og 메타가 없고, 캡션은 class="Caption" div 안에
+// 계정명 링크 + 캡션 텍스트 형태로 들어 있다.
+function parseInstagramEmbed(
+  html: string,
+): { username: string; caption: string; locations: string[] } {
+  let username = "";
+  let caption = "";
+  const capIdx = html.indexOf('class="Caption"');
+  if (capIdx >= 0) {
+    // Caption div의 여는 태그 끝부터, 댓글 영역(CaptionComments) 앞까지
+    const tagEnd = html.indexOf(">", capIdx);
+    let seg = html.slice(tagEnd + 1, tagEnd + 20001);
+    const cut = seg.indexOf('class="CaptionComments"');
+    if (cut >= 0) {
+      const lt = seg.lastIndexOf("<", cut);
+      seg = seg.slice(0, lt >= 0 ? lt : cut);
     }
+    const userM = seg.match(/class="CaptionUsername"[^>]*>([^<]+)</);
+    if (userM) username = decodeEntities(userM[1]).trim();
+    caption = htmlToText(seg).trim();
+    // 캡션 텍스트 맨 앞에 붙은 계정명 제거
+    if (username && caption.startsWith(username)) {
+      caption = caption.slice(username.length).trim();
+    }
+  }
+  const locations: string[] = [];
+  for (
+    const m of html.matchAll(
+      /href="[^"]*\/explore\/locations\/[^"]*"[^>]*>([^<]{1,60})</g,
+    )
+  ) {
+    const name = decodeEntities(m[1]).trim();
+    if (name && !locations.includes(name)) locations.push(name);
+  }
+  return { username, caption, locations };
+}
+
+async function extractInstagram(url: URL): Promise<ExtractResult> {
+  // 1) 원본 페이지 og 시도. 크롤러 UA로만 og 메타가 돌아오는 경우가
+  //    많아 CRAWLER_UA를 쓴다. og:description 안 따옴표 구간이 캡션인데,
+  //    잘려서 오는 경우가 많다.
+  let ogTitle = "";
+  let ogDescription = "";
+  let ogCaption = "";
+  try {
+    const html = await fetchText(url.toString(), 10000, CRAWLER_UA);
+    ogTitle = metaContent(html, "og:title");
+    ogDescription = metaContent(html, "og:description");
+    const cap = ogDescription.match(/["“]([^"”]{10,})["”]/);
+    if (cap) ogCaption = cap[1].trim();
+  } catch (e) {
+    // 허용 목록 밖으로 리다이렉트된 경우는 폴백으로 삼키지 않고
+    // 핸들러가 "지원하지 않는 사이트"로 안내하게 그대로 던진다
+    if (e instanceof BlockedUrlError) throw e;
+    // 그 외 원본이 막히면 임베드로 폴백
+  }
+
+  // 2) 임베드 페이지 시도. 로그인 없이 열리는 경우가 많고 캡션 전문과
+  //    위치 태그가 들어 있다. 임베드 URL은 코드가 instagram.com으로
+  //    구성하므로 허용 목록 검사를 그대로 통과한다.
+  let embedCaption = "";
+  let embedUsername = "";
+  let locations: string[] = [];
+  const target = parseInstagramTarget(url);
+  if (target) {
+    try {
+      const embedUrl =
+        `https://www.instagram.com/${target.seg}/${target.code}/embed/captioned/`;
+      const html = await fetchText(embedUrl, 10000, CRAWLER_UA);
+      const parsed = parseInstagramEmbed(html);
+      embedCaption = parsed.caption;
+      embedUsername = parsed.username;
+      locations = parsed.locations;
+    } catch (e) {
+      if (e instanceof BlockedUrlError) throw e;
+      // 임베드까지 막히면 og 결과로 폴백
+    }
+  }
+
+  // og 캡션이 빈약하면(없거나 임베드 전문보다 짧으면) 임베드를 쓴다.
+  const useEmbed = embedCaption.length > ogCaption.length;
+  const caption = useEmbed ? embedCaption : ogCaption;
+  const genericTitle = !ogTitle || ogTitle.trim() === "Instagram";
+
+  if (!caption && genericTitle && locations.length === 0) {
     return {
-      ok: true,
-      title: title || "인스타그램 게시물",
-      candidates: extractCandidates(title, description, caption || bodyText),
-      source: "instagram",
+      ok: false,
+      reason:
+        "인스타그램이 로그인 벽으로 막아서 게시물 내용을 읽지 못했어요. 장소는 아래에서 직접 입력해 주세요.",
     };
   }
+
+  const title = !genericTitle
+    ? ogTitle
+    : embedUsername
+    ? `인스타그램 게시물 (@${embedUsername})`
+    : "인스타그램 게시물";
+  const candidates = extractCandidates(ogTitle, ogDescription, caption);
+  // 위치 태그는 실제 장소일 가능성이 가장 높아 맨 앞에 둔다
+  for (const loc of [...locations].reverse()) {
+    const name = cleanCandidate(loc);
+    if (
+      isValidCandidate(name) &&
+      !candidates.some((c) => c.name.replace(/\s+/g, "") === name.replace(/\s+/g, ""))
+    ) {
+      candidates.unshift({ name });
+    }
+  }
+  return {
+    ok: true,
+    title,
+    candidates: candidates.slice(0, 20),
+    source: "instagram",
+    source_detail: useEmbed ? "embed" : "og",
+  };
+}
+
+async function extractGeneric(url: URL): Promise<ExtractResult> {
+  const html = await fetchText(url.toString());
+  const title = metaContent(html, "og:title");
+  const description = metaContent(html, "og:description");
+  const bodyText = htmlToText(html);
 
   if (!title && bodyText.length < 100) {
     return {
@@ -609,6 +733,8 @@ Deno.serve(async (req: Request) => {
       /(^|\.)youtube\.com$/.test(url.hostname) || url.hostname === "youtu.be"
     ) {
       result = await extractYouTube(url);
+    } else if (/(^|\.)instagram\.com$/.test(url.hostname)) {
+      result = await extractInstagram(url);
     } else {
       result = await extractGeneric(url);
     }
