@@ -2,10 +2,16 @@
 // extract-places — 링크 수집함 자동 추출 (Supabase Edge Function)
 //
 // POST { url } 을 받아 게시물을 서버에서 읽고, 제목과 장소 후보를
-// 규칙 기반으로 뽑아 돌려줍니다. (브라우저는 CORS 때문에 외부
-// 페이지를 직접 읽을 수 없어서 서버에서 가져옵니다.)
+// 뽑아 돌려줍니다. (브라우저는 CORS 때문에 외부 페이지를 직접
+// 읽을 수 없어서 서버에서 가져옵니다.)
 //
-// 반환: { ok: true, title, candidates: [{ name, likely }], source }
+// 후보 추출은 Gemini AI가 1순위입니다 (환경변수 GEMINI_API_KEY가
+// 등록돼 있을 때). 키가 없거나 AI 호출이 실패하면 규칙 기반으로
+// 폴백합니다. 어느 경로로 뽑았는지는 응답의 method("ai"|"rules")로
+// 구분합니다.
+//
+// 반환: { ok: true, title, candidates: [{ name, likely, category? }],
+//         source, method }
 //       { ok: false, reason }
 //   likely=true인 후보만 화면에서 기본 체크된다.
 //
@@ -638,15 +644,221 @@ async function fetchText(
   }
 }
 
+type PlaceCandidate = {
+  name: string;
+  likely?: boolean;
+  category?: string;
+};
+
 type ExtractResult =
   | {
     ok: true;
     title: string;
-    candidates: { name: string; likely?: boolean }[];
+    candidates: PlaceCandidate[];
     source: string;
     source_detail?: string;
+    method: "ai" | "rules";
   }
   | { ok: false; reason: string };
+
+// === Gemini AI 추출 ===
+// 환경변수 GEMINI_API_KEY(Supabase Secrets에 등록)가 있으면 AI로
+// 후보를 뽑고, 없거나 실패하면 호출부가 규칙 기반으로 폴백한다.
+// Gemini 엔드포인트는 코드에 고정된 주소라, 사용자 URL에 적용되는
+// SSRF 허용 목록 검사와는 별개로 둔다.
+
+const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_ENDPOINT =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_TIMEOUT_MS = 8000;
+const AI_TEXT_LIMIT = 6000; // AI에 보낼 본문 최대 길이
+const AI_MAX_CANDIDATES = 15;
+
+// 앱의 saved_places 카테고리 체계
+const PLACE_CATEGORIES = [
+  "음료", "식사", "디저트", "카페", "쇼핑", "관광", "명소", "숙소",
+  "교통", "기타",
+];
+
+// AI가 자유롭게 적은 카테고리 추측을 위 체계로 정규화한다.
+const CATEGORY_ALIASES: [string, string][] = [
+  ["식사", "식사"], ["맛집", "식사"], ["음식", "식사"], ["식당", "식사"],
+  ["레스토랑", "식사"], ["restaurant", "식사"],
+  ["카페", "카페"], ["커피", "카페"], ["cafe", "카페"], ["coffee", "카페"],
+  ["음료", "음료"], ["밀크티", "음료"], ["버블티", "음료"], ["주스", "음료"],
+  ["음료수", "음료"], ["drink", "음료"],
+  ["디저트", "디저트"], ["베이커리", "디저트"], ["빵", "디저트"],
+  ["아이스크림", "디저트"], ["dessert", "디저트"], ["bakery", "디저트"],
+  ["쇼핑", "쇼핑"], ["상점", "쇼핑"], ["가게", "쇼핑"], ["몰", "쇼핑"],
+  ["마켓", "쇼핑"], ["shopping", "쇼핑"], ["store", "쇼핑"], ["shop", "쇼핑"],
+  ["숙소", "숙소"], ["호텔", "숙소"], ["hotel", "숙소"],
+  ["교통", "교통"], ["역", "교통"], ["공항", "교통"], ["터미널", "교통"],
+  ["station", "교통"],
+  ["명소", "명소"], ["랜드마크", "명소"], ["타워", "명소"],
+  ["landmark", "명소"],
+  ["관광", "관광"], ["관광지", "관광"], ["박물관", "관광"],
+  ["미술관", "관광"], ["공원", "관광"], ["시장", "관광"],
+  ["attraction", "관광"],
+];
+
+function normalizeCategory(guess: unknown): string {
+  if (typeof guess !== "string") return "기타";
+  const g = guess.trim();
+  if (!g) return "기타";
+  if (PLACE_CATEGORIES.includes(g)) return g;
+  const lower = g.toLowerCase();
+  for (const [key, value] of CATEGORY_ALIASES) {
+    if (lower.includes(key.toLowerCase())) return value;
+  }
+  return "기타";
+}
+
+function geminiApiKey(): string {
+  try {
+    return Deno.env.get("GEMINI_API_KEY") ?? "";
+  } catch {
+    return "";
+  }
+}
+
+// AI가 돌려준 이름 정리. 규칙 기반 cleanCandidate와 달리
+// "새턴버드(三顿半)" 같은 병기 괄호는 깨지 않고 유지한다.
+function cleanAiName(raw: string): string {
+  return String(raw ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[^가-힣A-Za-z0-9一-鿿]+/, "")
+    .replace(/[^가-힣A-Za-z0-9一-鿿)）]+$/, "")
+    .trim();
+}
+
+const AI_PROMPT_PREFIX =
+  `너는 여행 게시물에서 장소만 골라내는 추출기다.
+아래 여행 게시물 텍스트에서 실제로 방문할 수 있는 장소 이름(식당·카페·상점·관광지·호텔·랜드마크·역·시장 등)만 뽑아라.
+결제 브랜드(유니온페이·네이버페이·페이북 등), 플랫폼·앱 이름, 사람 이름, 계정명, 일반 명사, 장소가 아닌 해시태그는 제외해라.
+지점명이 있으면 지점까지 포함해라(예: 찰리타운 정안 캐리센터점).
+중국어 이름에 한국어/영어 병기가 있으면 "한국어명(중국어명)"처럼 함께 적어라.
+category_guess는 다음 중 하나로 골라라: 음료, 식사, 디저트, 카페, 쇼핑, 관광, 명소, 숙소, 교통, 기타.
+설명 없이 JSON 배열만 출력해라. 형식: [{"name": "장소 이름", "category_guess": "식사"}]
+장소가 없으면 빈 배열 []을 출력해라. 최대 15개까지만 뽑아라.
+
+[게시물 텍스트]
+`;
+
+// Gemini에 본문을 보내 장소 후보를 받는다. 키가 없거나 호출
+// 실패/타임아웃/파싱 실패면 null을 돌려주고, 호출부가 규칙
+// 기반으로 폴백한다.
+async function extractPlacesWithAi(
+  text: string,
+): Promise<PlaceCandidate[] | null> {
+  const apiKey = geminiApiKey();
+  if (!apiKey) return null;
+  const clipped = String(text ?? "").slice(0, AI_TEXT_LIMIT).trim();
+  if (!clipped) return null;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const res = await fetch(GEMINI_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{ text: AI_PROMPT_PREFIX + clipped }],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.1,
+          maxOutputTokens: 1024,
+        },
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) return null;
+    const textOut = parts
+      .map((p: { text?: unknown }) =>
+        typeof p?.text === "string" ? p.text : ""
+      )
+      .join("")
+      .trim();
+    if (!textOut) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(textOut);
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const out: PlaceCandidate[] = [];
+    const seen = new Set<string>();
+    for (const item of parsed) {
+      const rawName = typeof item === "string"
+        ? item
+        : (item as { name?: unknown })?.name;
+      if (typeof rawName !== "string") continue;
+      const name = cleanAiName(rawName);
+      if (!isValidCandidate(name)) continue;
+      const key = name.replace(/\s+/g, "").toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        name,
+        likely: true,
+        category: normalizeCategory(
+          (item as { category_guess?: unknown })?.category_guess,
+        ),
+      });
+      if (out.length >= AI_MAX_CANDIDATES) break;
+    }
+    return out;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 후보 확정: AI가 성공하면 AI 결과를 쓰고, 위치 태그처럼 신호가
+// 확실한 pinned 이름은 AI 결과와 무관하게 맨 앞에 likely로 유지한다.
+// AI를 못 쓰면 rules() 콜백의 규칙 기반 결과를 그대로 쓴다
+// (규칙 경로에서 pinned 병합은 콜백 쪽이 담당한다).
+async function finalizeCandidates(opts: {
+  aiText: string;
+  rules: () => PlaceCandidate[];
+  pinned?: string[];
+  limit: number;
+}): Promise<{ candidates: PlaceCandidate[]; method: "ai" | "rules" }> {
+  const ai = await extractPlacesWithAi(opts.aiText);
+  if (ai) {
+    const merged: PlaceCandidate[] = [];
+    const seen = new Set<string>();
+    for (const raw of opts.pinned ?? []) {
+      const name = cleanCandidate(raw);
+      if (!isValidCandidate(name)) continue;
+      const key = name.replace(/\s+/g, "").toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push({ name, likely: true });
+    }
+    for (const c of ai) {
+      const key = c.name.replace(/\s+/g, "").toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(c);
+    }
+    return { candidates: merged.slice(0, opts.limit), method: "ai" };
+  }
+  return {
+    candidates: opts.rules().slice(0, opts.limit),
+    method: "rules",
+  };
+}
 
 async function extractNaverBlog(url: URL): Promise<ExtractResult> {
   // blog.naver.com/{blogId}/{logNo} 또는 PostView 주소를 blogId/logNo로 변환
@@ -708,11 +920,17 @@ async function extractNaverBlog(url: URL): Promise<ExtractResult> {
       reason: "블로그 본문을 읽지 못했어요. 비공개 글이거나 주소가 잘못됐을 수 있어요.",
     };
   }
+  const { candidates, method } = await finalizeCandidates({
+    aiText: [title, description, bodyText].filter(Boolean).join("\n"),
+    rules: () => extractCandidates(title, description, bodyText),
+    limit: 20,
+  });
   return {
     ok: true,
     title,
-    candidates: extractCandidates(title, description, bodyText),
+    candidates,
     source: "naver_blog",
+    method,
   };
 }
 
@@ -743,11 +961,17 @@ async function extractYouTube(url: URL): Promise<ExtractResult> {
       reason: "유튜브 영상 제목을 읽지 못했어요. 삭제됐거나 비공개 영상일 수 있어요.",
     };
   }
+  const { candidates, method } = await finalizeCandidates({
+    aiText: [title, description].filter(Boolean).join("\n"),
+    rules: () => extractCandidates(title, description, description),
+    limit: 20,
+  });
   return {
     ok: true,
     title,
-    candidates: extractCandidates(title, description, description),
+    candidates,
     source: "youtube",
+    method,
   };
 }
 
@@ -868,31 +1092,45 @@ async function extractInstagram(url: URL): Promise<ExtractResult> {
     excludeNames.push(dispM[1].trim(), `${dispM[1].trim()}님`);
   }
   if (embedUsername) excludeNames.push(embedUsername);
-  const candidates = extractCandidates(ogTitle, ogDescription, caption, {
-    source: "instagram",
-    username: embedUsername,
-    excludeNames,
+  const { candidates, method } = await finalizeCandidates({
+    aiText: [
+      caption,
+      locations.length ? `위치 태그: ${locations.join(", ")}` : "",
+    ].filter(Boolean).join("\n"),
+    // 위치 태그는 AI 경로에서는 pinned으로 맨 앞에 유지되고,
+    // 규칙 경로에서는 아래 콜백이 기존처럼 병합한다.
+    pinned: locations,
+    rules: () => {
+      const list = extractCandidates(ogTitle, ogDescription, caption, {
+        source: "instagram",
+        username: embedUsername,
+        excludeNames,
+      });
+      // 위치 태그는 실제 장소일 가능성이 가장 높아 맨 앞에 두고 likely로 표시
+      for (const loc of [...locations].reverse()) {
+        const name = cleanCandidate(loc);
+        if (!isValidCandidate(name)) continue;
+        const key = name.replace(/\s+/g, "").toLowerCase();
+        const existing = list.find(
+          (c) => c.name.replace(/\s+/g, "").toLowerCase() === key,
+        );
+        if (existing) {
+          existing.likely = true;
+        } else {
+          list.unshift({ name, likely: true });
+        }
+      }
+      return list;
+    },
+    limit: 12,
   });
-  // 위치 태그는 실제 장소일 가능성이 가장 높아 맨 앞에 두고 likely로 표시
-  for (const loc of [...locations].reverse()) {
-    const name = cleanCandidate(loc);
-    if (!isValidCandidate(name)) continue;
-    const key = name.replace(/\s+/g, "").toLowerCase();
-    const existing = candidates.find(
-      (c) => c.name.replace(/\s+/g, "").toLowerCase() === key,
-    );
-    if (existing) {
-      existing.likely = true;
-    } else {
-      candidates.unshift({ name, likely: true });
-    }
-  }
   return {
     ok: true,
     title,
-    candidates: candidates.slice(0, 12),
+    candidates,
     source: "instagram",
     source_detail: useEmbed ? "embed" : "og",
+    method,
   };
 }
 
@@ -909,11 +1147,17 @@ async function extractGeneric(url: URL): Promise<ExtractResult> {
         "페이지 내용을 읽지 못했어요. 로그인 벽이 있거나 주소가 잘못됐을 수 있어요.",
     };
   }
+  const { candidates, method } = await finalizeCandidates({
+    aiText: [title, description, bodyText].filter(Boolean).join("\n"),
+    rules: () => extractCandidates(title, description, bodyText),
+    limit: 20,
+  });
   return {
     ok: true,
     title: title || url.hostname,
-    candidates: extractCandidates(title, description, bodyText),
+    candidates,
     source: "web",
+    method,
   };
 }
 
