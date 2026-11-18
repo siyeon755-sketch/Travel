@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>여행·모임 정산 도구</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #6b7686;
+    --line: #e3e7ee; --brand: #2563eb; --brand-dark: #1d4ed8;
+    --danger: #dc2626; --ok: #15803d; --radius: 14px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic",
+      "Apple SD Gothic Neo", sans-serif; font-size: 15px; line-height: 1.5;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 16px 14px 48px; }
+  header.top {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 2px 14px;
+  }
+  header.top .logo { font-weight: 800; font-size: 18px; }
+  header.top .userbox { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px; margin-bottom: 12px;
+  }
+  h1 { font-size: 20px; margin: 4px 0 10px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  h3 { font-size: 15px; margin: 14px 0 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .empty {
+    text-align: center; color: var(--muted); padding: 26px 10px; font-size: 14px;
+    border: 1px dashed var(--line); border-radius: var(--radius); background: #fff;
+  }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
+  input[type="text"], input[type="email"], input[type="password"],
+  input[type="number"], input[type="date"], select, textarea {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 10px; font-size: 15px; background: #fff; color: var(--text);
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid #bfdbfe; border-color: var(--brand); }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button {
+    appearance: none; border: 0; cursor: pointer; font-size: 14px; font-weight: 700;
+    border-radius: 10px; padding: 11px 14px; background: var(--brand); color: #fff;
+  }
+  button:hover { background: var(--brand-dark); }
+  button.secondary { background: #eef2f7; color: var(--text); }
+  button.secondary:hover { background: #e2e8f0; }
+  button.danger { background: #fee2e2; color: var(--danger); }
+  button.small { padding: 7px 10px; font-size: 13px; border-radius: 8px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .btn-block { width: 100%; margin-top: 14px; }
+  .trip-item { cursor: pointer; }
+  .trip-item:hover { border-color: var(--brand); }
+  .trip-item .t-name { font-weight: 800; font-size: 16px; }
+  .tabs { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 12px; }
+  .tabs button {
+    flex: 0 0 auto; background: #eef2f7; color: var(--text); padding: 9px 13px;
+  }
+  .tabs button.active { background: var(--brand); color: #fff; }
+  .item-line {
+    display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;
+    padding: 10px 0; border-bottom: 1px solid var(--line);
+  }
+  .item-line:last-child { border-bottom: 0; }
+  .item-main { flex: 1; min-width: 0; }
+  .item-title { font-weight: 700; }
+  .chip {
+    display: inline-block; font-size: 12px; font-weight: 700; color: var(--brand-dark);
+    background: #dbeafe; border-radius: 999px; padding: 2px 8px; margin-right: 6px;
+  }
+  .warn {
+    background: #fef3c7; border: 1px solid #fcd34d; color: #92400e;
+    border-radius: 10px; padding: 12px; font-size: 13px; margin-bottom: 12px;
+  }
+  .error {
+    background: #fee2e2; border: 1px solid #fca5a5; color: #991b1b;
+    border-radius: 10px; padding: 12px; font-size: 13px; margin-bottom: 12px; display: none;
+  }
+  .ok-msg { color: var(--ok); font-size: 13px; font-weight: 700; }
+  .seg-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; }
+  .check-grid { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; }
+  .check-grid label { display: inline-flex; align-items: center; gap: 5px; font-weight: 500; margin: 0; font-size: 14px; }
+  table.settle { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.settle th, table.settle td { padding: 7px 6px; border-bottom: 1px solid var(--line); text-align: right; }
+  table.settle th:first-child, table.settle td:first-child { text-align: left; }
+  .transfer {
+    background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; font-weight: 700;
+  }
+  .linkbox {
+    word-break: break-all; background: #f1f5f9; border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; margin-bottom: 10px;
+  }
+  .hidden { display: none !important; }
+  .auth-switch { display: flex; gap: 6px; margin-bottom: 6px; }
+  .auth-switch button { flex: 1; background: #eef2f7; color: var(--text); }
+  .auth-switch button.active { background: var(--brand); color: #fff; }
+  .day-head { font-weight: 800; margin: 16px 0 6px; }
+  .total-box { font-weight: 800; font-size: 16px; text-align: right; padding: 8px 2px; }
+  .checkline { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .checkline:last-child { border-bottom: 0; }
+  .checkline .done-text { text-decoration: line-through; color: var(--muted); }
+  .checkline input[type="checkbox"] { width: 20px; height: 20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="logo">🧳 여행·모임 정산 도구</div>
+    <div class="userbox">
+      <span id="userEmail"></span>
+      <button id="logoutBtn" class="secondary small hidden">로그아웃</button>
+    </div>
+  </header>
+
+  <div id="configWarn" class="warn hidden">
+    ⚠️ Supabase 설정이 아직 비어 있습니다. index.html 상단의
+    <b>SUPABASE_URL</b>과 <b>SUPABASE_ANON_KEY</b>에 실제 값을 넣어야 로그인할 수 있습니다.
+    (자세한 방법은 README.md 참고)
+  </div>
+  <div id="errorBox" class="error"></div>
+
+  <!-- 인증 화면 -->
+  <section id="authView" class="hidden">
+    <div class="card">
+      <h1 id="authTitle">로그인</h1>
+      <div class="auth-switch">
+        <button id="switchLogin" class="active">로그인</button>
+        <button id="switchSignup">회원가입</button>
+      </div>
+      <div id="nameField">
+        <label for="displayName">이름 (표시 이름)</label>
+        <input type="text" id="displayName" placeholder="예: 김시연" autocomplete="name">
+      </div>
+      <label for="email">이메일</label>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+      <label for="password">비밀번호</label>
+      <input type="password" id="password" placeholder="6자 이상" autocomplete="current-password">
+      <button id="authSubmit" class="btn-block">로그인</button>
+      <p id="authMsg" class="muted"></p>
+    </div>
+    <p class="muted" style="text-align:center">초대 링크로 들어오셨다면, 먼저 로그인/회원가입을 해 주세요. 자동으로 여행에 참여됩니다.</p>
+  </section>
+
+  <!-- 내 여행 목록 -->
+  <section id="tripsView" class="hidden">
+    <div class="card">
+      <h2>새 여행 만들기</h2>
+      <label for="tripName">여행 이름</label>
+      <input type="text" id="tripName" placeholder="예: 상하이 여행">
+      <label for="tripDest">여행지</label>
+      <input type="text" id="tripDest" placeholder="예: 상하이">
+      <div class="row">
+        <div>
+          <label for="tripStart">시작일</label>
+          <input type="date" id="tripStart">
+        </div>
+        <div>
+          <label for="tripEnd">종료일</label>
+          <input type="date" id="tripEnd">
+        </div>
+      </div>
+      <button id="createTripBtn" class="btn-block">여행 만들기</button>
+    </div>
+    <h2>내 여행</h2>
+    <div id="tripList"></div>
+  </section>
+
+  <!-- 여행 상세 -->
+  <section id="tripView" class="hidden">
+    <button id="backBtn" class="secondary small">← 여행 목록으로</button>
+    <h1 id="tripTitle" style="margin-top:12px"></h1>
+    <p id="tripMeta" class="muted"></p>
+    <div class="tabs" id="tabBar">
+      <button data-tab="plan" class="active">📅 일정</button>
+      <button data-tab="places">📍 장소 보관함</button>
+      <button data-tab="checklist">🎒 준비물</button>
+      <button data-tab="settle">💸 정산</button>
+      <button data-tab="share">🔗 공유</button>
+    </div>
+
+    <!-- 일정 탭 -->
+    <div id="tab-plan">
+      <div class="total-box">예상 총예산: <span id="planTotal">0원</span></div>
+      <div id="planDays"></div>
+      <div class="card">
+        <h3>일정 추가</h3>
+        <label for="piDay">날짜</label>
+        <select id="piDay"></select>
+        <div class="row">
+          <div>
+            <label for="piTime">시간</label>
+            <input type="text" id="piTime" placeholder="예: 10:00">
+          </div>
+          <div>
+            <label for="piCost">예상 비용 (원)</label>
+            <input type="number" id="piCost" min="0" placeholder="0">
+          </div>
+        </div>
+        <label for="piTitle">장소/제목</label>
+        <input type="text" id="piTitle" placeholder="예: 와이탄 산책">
+        <label for="piMemo">메모</label>
+        <input type="text" id="piMemo" placeholder="메모 (선택)">
+        <button id="addPlanBtn" class="btn-block">일정 추가</button>
+      </div>
+    </div>
+
+    <!-- 장소 보관함 탭 -->
+    <div id="tab-places" class="hidden">
+      <div class="card">
+        <h3>장소 추가</h3>
+        <label for="plName">장소 이름</label>
+        <input type="text" id="plName" placeholder="예: 새턴버드 커피">
+        <label for="plCategory">카테고리</label>
+        <select id="plCategory">
+          <option>음료</option><option>식사</option><option>디저트</option>
+          <option>카페</option><option>쇼핑</option><option>관광</option>
+          <option>명소</option><option>숙소</option><option>교통</option>
+          <option selected>기타</option>
+        </select>
+        <label for="plMemo">메모</label>
+        <input type="text" id="plMemo" placeholder="메모 (선택)">
+        <button id="addPlaceBtn" class="btn-block">장소 저장</button>
+      </div>
+      <div id="placeList"></div>
+    </div>
+
+    <!-- 준비물 탭 -->
+    <div id="tab-checklist" class="hidden">
+      <div class="card">
+        <h3>준비물 추가</h3>
+        <div class="row">
+          <input type="text" id="clText" placeholder="예: 여권, 충전기">
+          <button id="addCheckBtn" style="flex:0 0 auto">추가</button>
+        </div>
+      </div>
+      <div class="card" id="checkList"></div>
+    </div>
+
+    <!-- 정산 탭 -->
+    <div id="tab-settle" class="hidden">
+      <div class="card">
+        <h3>정산 멤버</h3>
+        <div id="memberChips" style="margin-bottom:8px"></div>
+        <div class="row">
+          <input type="text" id="newMemberName" placeholder="멤버 이름 (예: 친구A)">
+          <button id="addMemberBtn" style="flex:0 0 auto">멤버 추가</button>
+        </div>
+        <p class="muted">여행에 참여한 사람은 자동으로 멤버에 들어갑니다. 계정이 없는 동행자는 이름만 추가하세요.</p>
+      </div>
+
+      <div class="card">
+        <h3>지출 추가</h3>
+        <label for="exTitle">지출 이름</label>
+        <input type="text" id="exTitle" placeholder="예: 숙소, 저녁 식사">
+        <label for="exPayer">결제한 사람</label>
+        <select id="exPayer"></select>
+        <h3>구간 나누기</h3>
+        <p class="muted">숙소처럼 밤마다 인원이 다르면 구간을 나눠 구간별로 참여자를 따로 고르세요. 구간 금액의 합이 지출 총액이 됩니다.</p>
+        <div id="segList"></div>
+        <button id="addSegBtn" class="secondary btn-block">+ 구간 추가</button>
+        <div class="total-box">지출 총액: <span id="exTotal">0원</span></div>
+        <button id="addExpenseBtn" class="btn-block">지출 저장</button>
+      </div>
+
+      <h3>지출 목록</h3>
+      <div id="expenseList"></div>
+
+      <div class="card">
+        <h3>정산 결과</h3>
+        <div id="settleResult"></div>
+        <button id="copySettleBtn" class="btn-block secondary">📋 정산 결과 텍스트 복사</button>
+        <p id="copyMsg" class="ok-msg"></p>
+      </div>
+    </div>
+
+    <!-- 공유 탭 -->
+    <div id="tab-share" class="hidden">
+      <div class="card">
+        <h3>초대 링크</h3>
+        <p class="muted">이 링크를 동행자에게 보내세요. 링크를 열고 로그인하면 자동으로 이 여행의 멤버가 됩니다.</p>
+        <div class="linkbox" id="inviteLink"></div>
+        <button id="copyInviteBtn" class="btn-block">📋 초대 링크 복사</button>
+        <p id="inviteCopyMsg" class="ok-msg"></p>
+      </div>
+      <div class="card">
+        <h3>함께하는 사람</h3>
+        <div id="tripMemberList"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+/* ============================================================
+   설정: 아래 두 값을 Supabase 프로젝트 값으로 교체하세요.
+   Supabase 대시보드 > Project Settings > API 에서 확인할 수 있습니다.
+   ============================================================ */
+const SUPABASE_URL = 'https://vudejtbevpvqlqogrpys.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_fA207xsdW-bEa_XR0Y9wAA_RX3FpAtq';
+
+/* ============================================================
+   정산 계산 로직 (순수 함수)
+   members:  [{ id, name }]
+   expenses: [{ payer_member_id, segments: [{ amount, participant_ids: [memberId...] }] }]
+   반환: { burden, paid, net, transfers: [{ from, to, amount }] }
+   ============================================================ */
+// === SETTLEMENT LOGIC START ===
+function computeSettlement(members, expenses) {
+  const burden = {}, paid = {};
+  members.forEach(m => { burden[m.id] = 0; paid[m.id] = 0; });
+
+  (expenses || []).forEach(exp => {
+    let total = 0;
+    (exp.segments || []).forEach(seg => {
+      const parts = seg.participant_ids || [];
+      if (!parts.length) return;
+      total += Number(seg.amount) || 0;
+      const share = (Number(seg.amount) || 0) / parts.length;
+      parts.forEach(pid => { if (pid in burden) burden[pid] += share; });
+    });
+    if (exp.payer_member_id in paid) paid[exp.payer_member_id] += total;
+  });
+
+  const net = {};
+  members.forEach(m => { net[m.id] = paid[m.id] - burden[m.id]; });
+
+  // 탐욕 알고리즘: 채무자(순액<0)가 채권자(순액>0)에게 송금
+  const creditors = members
+    .filter(m => net[m.id] > 0.5)
+    .map(m => ({ id: m.id, amt: net[m.id] }))
+    .sort((a, b) => b.amt - a.amt);
+  const debtors = members
+    .filter(m => net[m.id] < -0.5)
+    .map(m => ({ id: m.id, amt: -net[m.id] }))
+    .sort((a, b) => b.amt - a.amt);
+
+  const transfers = [];
+  let i = 0, j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const pay = Math.min(debtors[i].amt, creditors[j].amt);
+    if (pay > 0.5) {
+      transfers.push({ from: debtors[i].id, to: creditors[j].id, amount: Math.round(pay) });
+    }
+    debtors[i].amt -= pay;
+    creditors[j].amt -= pay;
+    if (debtors[i].amt <= 0.5) i++;
+    if (creditors[j].amt <= 0.5) j++;
+  }
+  return { burden, paid, net, transfers };
+}
+// === SETTLEMENT LOGIC END ===
+
+/* ============================================================
+   앱 상태 / 유틸
+   ============================================================ */
+const $ = id => document.getElementById(id);
+const fmt = n => (Math.round(Number(n) || 0)).toLocaleString('ko-KR') + '원';
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function showError(msg) {
+  const box = $('errorBox');
+  if (!msg) { box.style.display = 'none'; box.textContent = ''; return; }
+  box.textContent = msg;
+  box.style.display = 'block';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+const configured = SUPABASE_URL.startsWith('http') && SUPABASE_ANON_KEY.length > 20;
+if (!configured) $('configWarn').classList.remove('hidden');
+
+const sb = configured ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+const state = {
+  user: null,
+  profile: null,
+  trips: [],
+  trip: null,          // 현재 열린 여행
+  members: [],         // 정산 멤버
+  tripMembers: [],     // 계정 멤버
+  planItems: [],
+  places: [],
+  checklist: [],
+  expenses: [],        // segments + participant_ids 포함
+  tab: 'plan',
+  authMode: 'login',
+  segCounter: 0,
+};
+
+// 날짜 유틸
+function dayCount(trip) {
+  if (!trip.start_date || !trip.end_date) return 1;
+  const s = new Date(trip.start_date + 'T00:00:00');
+  const e = new Date(trip.end_date + 'T00:00:00');
+  const n = Math.round((e - s) / 86400000) + 1;
+  return Math.min(Math.max(n, 1), 60);
+}
+function dayLabel(trip, idx) {
+  if (!trip.start_date) return (idx + 1) + '일차';
+  const d = new Date(trip.start_date + 'T00:00:00');
+  d.setDate(d.getDate() + idx);
+  const week = ['일', '월', '화', '수', '목', '금', '토'][d.getDay()];
+  return `${idx + 1}일차 · ${d.getMonth() + 1}/${d.getDate()} (${week})`;
+}
+
+/* ============================================================
+   초대 링크 처리
+   ============================================================ */
+function pendingInviteCode() {
+  const fromUrl = new URLSearchParams(location.search).get('invite');
+  if (fromUrl) {
+    localStorage.setItem('pendingInvite', fromUrl);
+    return fromUrl;
+  }
+  return localStorage.getItem('pendingInvite');
+}
+
+async function processInvite() {
+  const code = pendingInviteCode();
+  if (!code || !state.user) return;
+  const { data, error } = await sb.rpc('join_trip_by_code', { code });
+  localStorage.removeItem('pendingInvite');
+  const url = new URL(location.href);
+  url.searchParams.delete('invite');
+  history.replaceState({}, '', url.toString());
+  if (error) { showError('초대 참여에 실패했습니다: ' + error.message); return; }
+  await loadTrips();
+  if (data) openTrip(data);
+}
+
+/* ============================================================
+   인증
+   ============================================================ */
+function setAuthMode(mode) {
+  state.authMode = mode;
+  $('switchLogin').classList.toggle('active', mode === 'login');
+  $('switchSignup').classList.toggle('active', mode === 'signup');
+  $('nameField').style.display = mode === 'signup' ? 'block' : 'none';
+  $('authTitle').textContent = mode === 'signup' ? '회원가입' : '로그인';
+  $('authSubmit').textContent = mode === 'signup' ? '회원가입' : '로그인';
+  $('authMsg').textContent = '';
+}
+$('switchLogin').onclick = () => setAuthMode('login');
+$('switchSignup').onclick = () => setAuthMode('signup');
+
+$('authSubmit').onclick = async () => {
+  if (!sb) { showError('Supabase 설정이 필요합니다. README.md를 확인하세요.'); return; }
+  showError('');
+  const email = $('email').value.trim();
+  const password = $('password').value;
+  if (!email || !password) { showError('이메일과 비밀번호를 입력하세요.'); return; }
+  try {
+    if (state.authMode === 'signup') {
+      const name = $('displayName').value.trim();
+      if (!name) { showError('이름을 입력하세요.'); return; }
+      const { data, error } = await sb.auth.signUp({
+        email, password, options: { data: { display_name: name } },
+      });
+      if (error) throw error;
+      if (!data.session) {
+        $('authMsg').textContent = '가입 확인 메일을 보냈습니다. 메일의 링크를 누른 뒤 로그인해 주세요.';
+        setAuthMode('login');
+        return;
+      }
+    } else {
+      const { error } = await sb.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+    }
+  } catch (e) {
+    showError('인증 실패: ' + e.message);
+  }
+};
+
+$('logoutBtn').onclick = async () => { await sb.auth.signOut(); };
+
+async function ensureProfile() {
+  const { data } = await sb.from('profiles').select('*').eq('id', state.user.id).maybeSingle();
+  if (data) { state.profile = data; return; }
+  const name = state.user.user_metadata?.display_name
+    || state.user.email.split('@')[0] || '사용자';
+  const { data: created } = await sb.from('profiles')
+    .insert({ id: state.user.id, display_name: name }).select().single();
+  state.profile = created || { id: state.user.id, display_name: name };
+}
+
+async function onSignedIn() {
+  $('userEmail').textContent = state.user.email;
+  $('logoutBtn').classList.remove('hidden');
+  $('authView').classList.add('hidden');
+  await ensureProfile();
+  await processInvite();
+  if (!state.trip) {
+    await loadTrips();
+    showView('trips');
+  }
+}
+
+function onSignedOut() {
+  state.user = null; state.trip = null; state.trips = [];
+  $('userEmail').textContent = '';
+  $('logoutBtn').classList.add('hidden');
+  $('tripsView').classList.add('hidden');
+  $('tripView').classList.add('hidden');
+  $('authView').classList.remove('hidden');
+}
+
+function showView(name) {
+  $('tripsView').classList.toggle('hidden', name !== 'trips');
+  $('tripView').classList.toggle('hidden', name !== 'trip');
+  $('authView').classList.add('hidden');
+}
+</script>
+
+<script>
+/* ============================================================
+   여행 목록 / 만들기
+   ============================================================ */
+async function loadTrips() {
+  const { data, error } = await sb.from('trips')
+    .select('*').order('created_at', { ascending: false });
+  if (error) { showError('여행 목록을 불러오지 못했습니다: ' + error.message); return; }
+  state.trips = data || [];
+  renderTrips();
+}
+
+function renderTrips() {
+  const box = $('tripList');
+  if (!state.trips.length) {
+    box.innerHTML = '<div class="empty">아직 만든 여행이 없습니다.<br>위에서 첫 여행을 만들어 보세요.</div>';
+    return;
+  }
+  box.innerHTML = state.trips.map(t => `
+    <div class="card trip-item" data-trip="${t.id}">
+      <div class="t-name">${esc(t.name)}</div>
+      <div class="muted">${esc(t.destination || '')}
+        ${t.start_date ? ` · ${t.start_date} ~ ${t.end_date || ''}` : ''}</div>
+    </div>`).join('');
+  box.querySelectorAll('[data-trip]').forEach(el => {
+    el.onclick = () => openTrip(el.dataset.trip);
+  });
+}
+
+$('createTripBtn').onclick = async () => {
+  showError('');
+  const name = $('tripName').value.trim();
+  if (!name) { showError('여행 이름을 입력하세요.'); return; }
+  const payload = {
+    owner_id: state.user.id,
+    name,
+    destination: $('tripDest').value.trim(),
+    start_date: $('tripStart').value || null,
+    end_date: $('tripEnd').value || null,
+  };
+  const { data, error } = await sb.from('trips').insert(payload).select().single();
+  if (error) { showError('여행 만들기에 실패했습니다: ' + error.message); return; }
+  $('tripName').value = ''; $('tripDest').value = '';
+  $('tripStart').value = ''; $('tripEnd').value = '';
+  await loadTrips();
+  openTrip(data.id);
+};
+
+/* ============================================================
+   여행 상세
+   ============================================================ */
+async function openTrip(tripId) {
+  const trip = state.trips.find(t => t.id === tripId)
+    || (await sb.from('trips').select('*').eq('id', tripId).single()).data;
+  if (!trip) { showError('여행을 찾을 수 없습니다.'); return; }
+  state.trip = trip;
+  showView('trip');
+  $('tripTitle').textContent = trip.name;
+  $('tripMeta').textContent =
+    `${trip.destination || ''}${trip.start_date ? ` · ${trip.start_date} ~ ${trip.end_date || ''}` : ''}`;
+  await loadTripData();
+  setTab('plan');
+}
+
+$('backBtn').onclick = async () => {
+  state.trip = null;
+  await loadTrips();
+  showView('trips');
+};
+
+async function loadTripData() {
+  const tid = state.trip.id;
+  const [tm, mem, pi, pl, cl, ex] = await Promise.all([
+    sb.from('trip_members').select('*').eq('trip_id', tid),
+    sb.from('members').select('*').eq('trip_id', tid).order('created_at'),
+    sb.from('plan_items').select('*').eq('trip_id', tid).order('created_at'),
+    sb.from('saved_places').select('*').eq('trip_id', tid).order('created_at'),
+    sb.from('checklist_items').select('*').eq('trip_id', tid).order('created_at'),
+    sb.from('expenses')
+      .select('*, expense_segments(*, segment_shares(member_id))')
+      .eq('trip_id', tid).order('created_at'),
+  ]);
+  state.tripMembers = tm.data || [];
+  state.members = mem.data || [];
+  state.planItems = pi.data || [];
+  state.places = pl.data || [];
+  state.checklist = cl.data || [];
+  state.expenses = (ex.data || []).map(e => ({
+    ...e,
+    segments: (e.expense_segments || []).map(s => ({
+      id: s.id, label: s.label, amount: Number(s.amount) || 0,
+      participant_ids: (s.segment_shares || []).map(sh => sh.member_id),
+    })),
+  }));
+  renderPlan(); renderPlaces(); renderChecklist(); renderSettle(); renderShare();
+}
+
+function setTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('#tabBar button').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab));
+  ['plan', 'places', 'checklist', 'settle', 'share'].forEach(t =>
+    $('tab-' + t).classList.toggle('hidden', t !== tab));
+}
+document.querySelectorAll('#tabBar button').forEach(b => {
+  b.onclick = () => setTab(b.dataset.tab);
+});
+
+/* ============================================================
+   일정 탭
+   ============================================================ */
+function renderPlan() {
+  const trip = state.trip;
+  const n = dayCount(trip);
+  $('piDay').innerHTML = Array.from({ length: n }, (_, i) =>
+    `<option value="${i}">${dayLabel(trip, i)}</option>`).join('');
+
+  let total = 0;
+  state.planItems.forEach(p => { total += Number(p.expected_cost) || 0; });
+  $('planTotal').textContent = fmt(total);
+
+  const box = $('planDays');
+  let html = '';
+  for (let d = 0; d < n; d++) {
+    const items = state.planItems.filter(p => p.day_index === d);
+    html += `<div class="day-head">${dayLabel(trip, d)}</div>`;
+    if (!items.length) {
+      html += '<div class="empty" style="padding:14px">아직 일정이 없습니다.</div>';
+    } else {
+      html += '<div class="card">' + items.map(p => `
+        <div class="item-line">
+          <div class="item-main">
+            <div class="item-title">${p.time_text ? esc(p.time_text) + ' · ' : ''}${esc(p.title)}</div>
+            <div class="muted">${esc(p.memo || '')}${p.expected_cost ? ` · 예상 ${fmt(p.expected_cost)}` : ''}</div>
+          </div>
+          <button class="danger small" data-del-plan="${p.id}">삭제</button>
+        </div>`).join('') + '</div>';
+    }
+  }
+  box.innerHTML = html;
+  box.querySelectorAll('[data-del-plan]').forEach(b => {
+    b.onclick = async () => {
+      await sb.from('plan_items').delete().eq('id', b.dataset.delPlan);
+      await loadTripData();
+    };
+  });
+}
+
+$('addPlanBtn').onclick = async () => {
+  const title = $('piTitle').value.trim();
+  if (!title) { showError('일정 제목을 입력하세요.'); return; }
+  showError('');
+  const { error } = await sb.from('plan_items').insert({
+    trip_id: state.trip.id,
+    day_index: Number($('piDay').value),
+    time_text: $('piTime').value.trim(),
+    title,
+    memo: $('piMemo').value.trim(),
+    expected_cost: Number($('piCost').value) || 0,
+    created_by: state.user.id,
+  });
+  if (error) { showError('일정 추가 실패: ' + error.message); return; }
+  $('piTitle').value = ''; $('piMemo').value = ''; $('piTime').value = ''; $('piCost').value = '';
+  await loadTripData();
+};
+
+/* ============================================================
+   장소 보관함 탭
+   ============================================================ */
+function renderPlaces() {
+  const box = $('placeList');
+  if (!state.places.length) {
+    box.innerHTML = '<div class="empty">아직 저장한 장소가 없습니다.<br>가고 싶은 장소를 위에 추가해 보세요.</div>';
+    return;
+  }
+  const n = dayCount(state.trip);
+  const dayOptions = Array.from({ length: n }, (_, i) =>
+    `<option value="${i}">${i + 1}일차</option>`).join('');
+  box.innerHTML = state.places.map(p => `
+    <div class="card">
+      <div class="item-line" style="border:0;padding:0">
+        <div class="item-main">
+          <div class="item-title"><span class="chip">${esc(p.category)}</span>${esc(p.name)}</div>
+          <div class="muted">${esc(p.memo || '')}</div>
+        </div>
+        <button class="danger small" data-del-place="${p.id}">삭제</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <select data-place-day="${p.id}">${dayOptions}</select>
+        <button class="secondary" data-place-add="${p.id}" style="flex:0 0 auto">일정에 넣기</button>
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('[data-del-place]').forEach(b => {
+    b.onclick = async () => {
+      await sb.from('saved_places').delete().eq('id', b.dataset.delPlace);
+      await loadTripData();
+    };
+  });
+  box.querySelectorAll('[data-place-add]').forEach(b => {
+    b.onclick = async () => {
+      const place = state.places.find(p => p.id === b.dataset.placeAdd);
+      const day = Number(box.querySelector(`[data-place-day="${place.id}"]`).value);
+      const { error } = await sb.from('plan_items').insert({
+        trip_id: state.trip.id, day_index: day,
+        title: place.name, memo: place.memo || '', created_by: state.user.id,
+      });
+      if (error) { showError('일정에 넣기 실패: ' + error.message); return; }
+      await loadTripData();
+      setTab('plan');
+    };
+  });
+}
+
+$('addPlaceBtn').onclick = async () => {
+  const name = $('plName').value.trim();
+  if (!name) { showError('장소 이름을 입력하세요.'); return; }
+  showError('');
+  const { error } = await sb.from('saved_places').insert({
+    trip_id: state.trip.id, name,
+    category: $('plCategory').value,
+    memo: $('plMemo').value.trim(),
+    created_by: state.user.id,
+  });
+  if (error) { showError('장소 저장 실패: ' + error.message); return; }
+  $('plName').value = ''; $('plMemo').value = '';
+  await loadTripData();
+};
+
+/* ============================================================
+   준비물 탭
+   ============================================================ */
+function renderChecklist() {
+  const box = $('checkList');
+  if (!state.checklist.length) {
+    box.innerHTML = '<div class="empty">아직 준비물이 없습니다.</div>';
+    return;
+  }
+  box.innerHTML = state.checklist.map(c => `
+    <div class="checkline">
+      <input type="checkbox" data-check="${c.id}" ${c.done ? 'checked' : ''}>
+      <div class="item-main ${c.done ? 'done-text' : ''}">${esc(c.text)}</div>
+      <button class="danger small" data-del-check="${c.id}">삭제</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-check]').forEach(cb => {
+    cb.onchange = async () => {
+      await sb.from('checklist_items').update({ done: cb.checked }).eq('id', cb.dataset.check);
+      await loadTripData();
+    };
+  });
+  box.querySelectorAll('[data-del-check]').forEach(b => {
+    b.onclick = async () => {
+      await sb.from('checklist_items').delete().eq('id', b.dataset.delCheck);
+      await loadTripData();
+    };
+  });
+}
+
+$('addCheckBtn').onclick = async () => {
+  const text = $('clText').value.trim();
+  if (!text) return;
+  const { error } = await sb.from('checklist_items')
+    .insert({ trip_id: state.trip.id, text });
+  if (error) { showError('준비물 추가 실패: ' + error.message); return; }
+  $('clText').value = '';
+  await loadTripData();
+};
+</script>
+
+<script>
+/* ============================================================
+   정산 탭
+   ============================================================ */
+function memberName(id) {
+  const m = state.members.find(m => m.id === id);
+  return m ? m.name : '(삭제된 멤버)';
+}
+
+function renderSettle() {
+  // 멤버 칩
+  $('memberChips').innerHTML = state.members.length
+    ? state.members.map(m =>
+        `<span class="chip" style="font-size:13px;padding:4px 10px">${esc(m.name)}</span>`).join('')
+    : '<span class="muted">멤버가 없습니다. 아래에서 멤버를 추가하세요.</span>';
+
+  // 구간 폼의 참여자 체크박스가 현재 멤버와 다르면 폼을 다시 그림
+  const existingParts = new Set(
+    [...document.querySelectorAll('#segList [data-seg-part]')].map(cb => cb.value));
+  const memberIds = new Set(state.members.map(m => m.id));
+  const partsMismatch = existingParts.size !== memberIds.size
+    || [...memberIds].some(id => !existingParts.has(id));
+  if (partsMismatch && state.members.length) {
+    const prev = collectSegments();
+    $('segList').innerHTML = '';
+    if (prev.length) {
+      prev.forEach(s => addSegmentRow(s.label, s.amount || '', s.participant_ids));
+    } else {
+      addSegmentRow();
+    }
+  }
+
+  // 결제자 선택
+  $('exPayer').innerHTML = state.members.map(m =>
+    `<option value="${m.id}">${esc(m.name)}</option>`).join('');
+
+  // 지출 목록
+  const box = $('expenseList');
+  if (!state.expenses.length) {
+    box.innerHTML = '<div class="empty">아직 지출이 없습니다.<br>숙소, 식사 같은 지출을 추가하면 정산 결과가 계산됩니다.</div>';
+  } else {
+    box.innerHTML = state.expenses.map(e => `
+      <div class="card">
+        <div class="item-line" style="border:0;padding:0">
+          <div class="item-main">
+            <div class="item-title">${esc(e.title)} · ${fmt(e.total_amount)}</div>
+            <div class="muted">결제: ${esc(memberName(e.payer_member_id))}</div>
+            ${(e.segments || []).map(s => `
+              <div class="muted">· ${esc(s.label || '구간')} ${fmt(s.amount)} —
+                ${s.participant_ids.map(memberName).map(esc).join(', ') || '참여자 없음'}</div>`).join('')}
+          </div>
+          <button class="danger small" data-del-expense="${e.id}">삭제</button>
+        </div>
+      </div>`).join('');
+    box.querySelectorAll('[data-del-expense]').forEach(b => {
+      b.onclick = async () => {
+        await sb.from('expenses').delete().eq('id', b.dataset.delExpense);
+        await loadTripData();
+      };
+    });
+  }
+
+  // 정산 결과
+  const res = computeSettlement(state.members, state.expenses);
+  const box2 = $('settleResult');
+  if (!state.members.length) {
+    box2.innerHTML = '<div class="empty">멤버를 먼저 추가하세요.</div>';
+  } else if (!state.expenses.length) {
+    box2.innerHTML = '<div class="empty">지출을 추가하면 누가 누구에게 얼마를 보내야 하는지 계산됩니다.</div>';
+  } else {
+    const rows = state.members.map(m => `
+      <tr>
+        <td>${esc(m.name)}</td>
+        <td>${fmt(res.burden[m.id])}</td>
+        <td>${fmt(res.paid[m.id])}</td>
+        <td>${res.net[m.id] > 0 ? '+' : ''}${fmt(res.net[m.id])}</td>
+      </tr>`).join('');
+    const transfers = res.transfers.length
+      ? res.transfers.map(t =>
+          `<div class="transfer">${esc(memberName(t.from))} → ${esc(memberName(t.to))} · ${fmt(t.amount)}</div>`).join('')
+      : '<p class="muted">주고받을 금액이 없습니다. 모두 정산 완료 상태입니다.</p>';
+    box2.innerHTML = `
+      <table class="settle">
+        <tr><th>멤버</th><th>부담액</th><th>결제액</th><th>차액</th></tr>
+        ${rows}
+      </table>
+      <h3>이렇게 보내세요</h3>
+      ${transfers}`;
+  }
+  state.lastSettlement = res;
+}
+
+function settlementText() {
+  const res = state.lastSettlement || computeSettlement(state.members, state.expenses);
+  const lines = [`[${state.trip.name} 정산 결과]`];
+  state.members.forEach(m => {
+    lines.push(`· ${m.name}: 부담 ${fmt(res.burden[m.id])} / 결제 ${fmt(res.paid[m.id])}`);
+  });
+  lines.push('');
+  if (res.transfers.length) {
+    res.transfers.forEach(t =>
+      lines.push(`👉 ${memberName(t.from)} → ${memberName(t.to)} : ${fmt(t.amount)}`));
+  } else {
+    lines.push('주고받을 금액이 없습니다.');
+  }
+  return lines.join('\n');
+}
+
+$('copySettleBtn').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(settlementText());
+    $('copyMsg').textContent = '복사했습니다. 단체 채팅방에 붙여넣으세요.';
+  } catch {
+    $('copyMsg').textContent = '복사에 실패했습니다. 브라우저 권한을 확인하세요.';
+  }
+};
+
+$('addMemberBtn').onclick = async () => {
+  const name = $('newMemberName').value.trim();
+  if (!name) { showError('멤버 이름을 입력하세요.'); return; }
+  showError('');
+  const { error } = await sb.from('members')
+    .insert({ trip_id: state.trip.id, name });
+  if (error) { showError('멤버 추가 실패: ' + error.message); return; }
+  $('newMemberName').value = '';
+  await loadTripData();
+  setTab('settle');
+};
+
+/* -------- 지출 입력: 구간 동적 폼 -------- */
+function addSegmentRow(label = '', amount = '', participants = null) {
+  const idx = ++state.segCounter;
+  const div = document.createElement('div');
+  div.className = 'seg-box';
+  div.dataset.seg = idx;
+  const checks = state.members.map(m => `
+    <label><input type="checkbox" data-seg-part="${idx}" value="${m.id}"
+      ${participants === null || participants.includes(m.id) ? 'checked' : ''}> ${esc(m.name)}</label>`).join('');
+  div.innerHTML = `
+    <div class="row">
+      <div>
+        <label>구간 이름</label>
+        <input type="text" data-seg-label="${idx}" placeholder="예: 1박째" value="${esc(label)}">
+      </div>
+      <div>
+        <label>금액 (원)</label>
+        <input type="number" data-seg-amount="${idx}" min="0" placeholder="0" value="${amount}">
+      </div>
+    </div>
+    <label>참여자</label>
+    <div class="check-grid">${checks || '<span class="muted">멤버가 없습니다.</span>'}</div>
+    <button class="danger small" style="margin-top:8px" data-seg-del="${idx}">구간 삭제</button>`;
+  $('segList').appendChild(div);
+  div.querySelector(`[data-seg-amount="${idx}"]`).oninput = updateExpenseTotal;
+  div.querySelector(`[data-seg-del="${idx}"]`).onclick = () => {
+    div.remove(); updateExpenseTotal();
+  };
+  updateExpenseTotal();
+}
+
+function collectSegments() {
+  const segs = [];
+  document.querySelectorAll('#segList .seg-box').forEach(box => {
+    const idx = box.dataset.seg;
+    const label = box.querySelector(`[data-seg-label="${idx}"]`).value.trim();
+    const amount = Number(box.querySelector(`[data-seg-amount="${idx}"]`).value) || 0;
+    const participant_ids = [...box.querySelectorAll(`[data-seg-part="${idx}"]:checked`)]
+      .map(cb => cb.value);
+    segs.push({ label, amount, participant_ids });
+  });
+  return segs;
+}
+
+function updateExpenseTotal() {
+  const total = collectSegments().reduce((s, x) => s + x.amount, 0);
+  $('exTotal').textContent = fmt(total);
+}
+
+$('addSegBtn').onclick = () => addSegmentRow();
+
+$('addExpenseBtn').onclick = async () => {
+  showError('');
+  const title = $('exTitle').value.trim();
+  if (!title) { showError('지출 이름을 입력하세요.'); return; }
+  const payer = $('exPayer').value;
+  if (!payer) { showError('결제한 사람을 선택하세요. 멤버를 먼저 추가하세요.'); return; }
+  const segs = collectSegments().filter(s => s.amount > 0);
+  if (!segs.length) { showError('금액이 있는 구간을 하나 이상 입력하세요.'); return; }
+  for (const s of segs) {
+    if (!s.participant_ids.length) {
+      showError(`"${s.label || '구간'}"의 참여자를 한 명 이상 선택하세요.`);
+      return;
+    }
+  }
+  const total = segs.reduce((sum, s) => sum + s.amount, 0);
+  const { data: exp, error } = await sb.from('expenses').insert({
+    trip_id: state.trip.id, title,
+    payer_member_id: payer, total_amount: total,
+    created_by: state.user.id,
+  }).select().single();
+  if (error) { showError('지출 저장 실패: ' + error.message); return; }
+
+  for (const s of segs) {
+    const { data: seg, error: segErr } = await sb.from('expense_segments')
+      .insert({ expense_id: exp.id, label: s.label, amount: s.amount })
+      .select().single();
+    if (segErr) { showError('구간 저장 실패: ' + segErr.message); return; }
+    const { error: shErr } = await sb.from('segment_shares').insert(
+      s.participant_ids.map(mid => ({ segment_id: seg.id, member_id: mid })));
+    if (shErr) { showError('참여자 저장 실패: ' + shErr.message); return; }
+  }
+  $('exTitle').value = '';
+  $('segList').innerHTML = '';
+  addSegmentRow();
+  await loadTripData();
+  setTab('settle');
+};
+
+/* ============================================================
+   공유 탭
+   ============================================================ */
+function renderShare() {
+  const link = `${location.origin}${location.pathname}?invite=${state.trip.invite_code}`;
+  $('inviteLink').textContent = link;
+  const box = $('tripMemberList');
+  box.innerHTML = state.tripMembers.length
+    ? state.tripMembers.map(tm => `
+      <div class="item-line">
+        <div class="item-main">
+          <span class="item-title">${esc(tm.display_name)}</span>
+          <span class="muted"> · ${tm.role === 'owner' ? '만든 사람' : '편집 가능'}</span>
+        </div>
+      </div>`).join('')
+    : '<div class="empty">아직 멤버 정보가 없습니다.</div>';
+}
+
+$('copyInviteBtn').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('inviteLink').textContent);
+    $('inviteCopyMsg').textContent = '초대 링크를 복사했습니다.';
+  } catch {
+    $('inviteCopyMsg').textContent = '복사에 실패했습니다. 링크를 직접 복사하세요.';
+  }
+};
+
+/* ============================================================
+   초기화
+   ============================================================ */
+setAuthMode('login');
+addSegmentRow();
+
+if (sb) {
+  sb.auth.onAuthStateChange(async (event, session) => {
+    if (session?.user) {
+      const changed = !state.user || state.user.id !== session.user.id;
+      state.user = session.user;
+      if (changed) await onSignedIn();
+      else if (!state.trip) { await loadTrips(); showView('trips'); }
+    } else {
+      onSignedOut();
+    }
+  });
+  (async () => {
+    const { data } = await sb.auth.getSession();
+    if (!data.session) onSignedOut();
+  })();
+} else {
+  $('authView').classList.remove('hidden');
+}
+</script>
+</body>
+</html>
