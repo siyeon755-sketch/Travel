@@ -676,9 +676,22 @@ type ExtractResult =
 // Gemini 엔드포인트는 코드에 고정된 주소라, 사용자 URL에 적용되는
 // SSRF 허용 목록 검사와는 별개로 둔다.
 
-const GEMINI_MODEL = "gemini-2.0-flash";
-const GEMINI_ENDPOINT =
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// 기본 모델. gemini-2.0-flash는 2026-06-01 종료돼 404가 나므로
+// 현행 모델을 쓴다. 환경변수 GEMINI_MODEL(Supabase Secrets)이
+// 있으면 그 값을 우선해, 다음 교체 때는 코드 수정 없이 바꿀 수 있다.
+const GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
+
+function geminiModel(): string {
+  try {
+    return Deno.env.get("GEMINI_MODEL")?.trim() || GEMINI_DEFAULT_MODEL;
+  } catch {
+    return GEMINI_DEFAULT_MODEL;
+  }
+}
+
+function geminiEndpoint(): string {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel()}:generateContent`;
+}
 const GEMINI_TIMEOUT_MS = 8000;
 const AI_TEXT_LIMIT = 6000; // AI에 보낼 본문 최대 길이
 const AI_MAX_CANDIDATES = 15;
@@ -795,7 +808,7 @@ async function extractPlacesWithAi(
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const res = await fetch(GEMINI_ENDPOINT, {
+    const res = await fetch(geminiEndpoint(), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -807,7 +820,9 @@ async function extractPlacesWithAi(
         }],
         generationConfig: {
           responseMimeType: "application/json",
-          temperature: 0.1,
+          // Gemini 3 계열: temperature는 지정하지 않고, 추출 작업이라
+          // 깊은 추론이 필요 없어 thinking level을 LOW로 둔다.
+          thinkingConfig: { thinkingLevel: "LOW" },
           maxOutputTokens: 1024,
         },
       }),
