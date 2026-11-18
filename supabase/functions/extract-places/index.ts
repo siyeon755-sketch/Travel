@@ -8,10 +8,13 @@
 // 후보 추출은 Gemini AI가 1순위입니다 (환경변수 GEMINI_API_KEY가
 // 등록돼 있을 때). 키가 없거나 AI 호출이 실패하면 규칙 기반으로
 // 폴백합니다. 어느 경로로 뽑았는지는 응답의 method("ai"|"rules")로
-// 구분합니다.
+// 구분합니다. AI를 못 쓴 이유는 ai_status("ok"|"no_key"|"error"|
+// "timeout"|"bad_response")와 ai_error(짧은 원인, 최대 200자)로
+// 함께 돌려주니, method가 "rules"로 나올 때 원인을 바로 확인할 수
+// 있습니다. (API 키 값 자체는 응답·로그 어디에도 남기지 않습니다.)
 //
 // 반환: { ok: true, title, candidates: [{ name, likely, category? }],
-//         source, method }
+//         source, method, ai_status, ai_error? }
 //       { ok: false, reason }
 //   likely=true인 후보만 화면에서 기본 체크된다.
 //
@@ -650,6 +653,10 @@ type PlaceCandidate = {
   category?: string;
 };
 
+// AI 추출 시도 결과 구분. "ok"면 AI가 후보를 뽑은 것이고, 나머지는
+// 규칙 기반으로 폴백한 이유다.
+type AiStatus = "ok" | "no_key" | "error" | "timeout" | "bad_response";
+
 type ExtractResult =
   | {
     ok: true;
@@ -658,6 +665,8 @@ type ExtractResult =
     source: string;
     source_detail?: string;
     method: "ai" | "rules";
+    ai_status: AiStatus;
+    ai_error?: string;
   }
   | { ok: false; reason: string };
 
@@ -745,16 +754,43 @@ category_guess는 다음 중 하나로 골라라: 음료, 식사, 디저트, 카
 [게시물 텍스트]
 `;
 
+// AI 추출 시도 결과. 실패 시 status로 원인을 구분하고, error에는
+// 짧은 원인(최대 200자)을 실어 응답의 ai_error와 함수 로그로 남긴다.
+type AiOutcome =
+  | { status: "ok"; candidates: PlaceCandidate[] }
+  | { status: Exclude<AiStatus, "ok">; error?: string };
+
+// 외부에서 온 문자열(오류 메시지 등)에 API 키가 섞여 있어도
+// 응답·로그에 그대로 나가지 않게 가린다.
+function scrubApiKey(text: string, apiKey: string): string {
+  if (!apiKey) return text;
+  return text.split(apiKey).join("***");
+}
+
+// AI 추출 실패 원인을 함수 로그에 남긴다 (Supabase 대시보드의
+// Edge Function 로그에서 확인 가능). 키 값은 절대 포함하지 않는다.
+function logAiFailure(status: AiStatus, error?: string): void {
+  console.error(
+    `[extract-places] ai_status=${status}${error ? ` ai_error=${error}` : ""}`,
+  );
+}
+
 // Gemini에 본문을 보내 장소 후보를 받는다. 키가 없거나 호출
-// 실패/타임아웃/파싱 실패면 null을 돌려주고, 호출부가 규칙
-// 기반으로 폴백한다.
+// 실패/타임아웃/파싱 실패면 status로 원인을 구분해 돌려주고,
+// 호출부가 규칙 기반으로 폴백한다.
 async function extractPlacesWithAi(
   text: string,
-): Promise<PlaceCandidate[] | null> {
+): Promise<AiOutcome> {
   const apiKey = geminiApiKey();
-  if (!apiKey) return null;
+  if (!apiKey) {
+    logAiFailure("no_key", "GEMINI_API_KEY not set");
+    return { status: "no_key" };
+  }
   const clipped = String(text ?? "").slice(0, AI_TEXT_LIMIT).trim();
-  if (!clipped) return null;
+  if (!clipped) {
+    logAiFailure("error", "empty_text");
+    return { status: "error", error: "empty_text" };
+  }
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
@@ -777,24 +813,64 @@ async function extractPlacesWithAi(
       }),
       signal: ctrl.signal,
     });
-    if (!res.ok) return null;
-    const data = await res.json();
+    if (!res.ok) {
+      // Gemini 오류 본문에서 핵심 메시지만 뽑아 원인으로 남긴다.
+      let detail = "";
+      try {
+        const errText = await res.text();
+        try {
+          const errJson = JSON.parse(errText);
+          detail = String(
+            errJson?.error?.message ?? errJson?.error?.status ?? "",
+          );
+        } catch {
+          detail = errText;
+        }
+      } catch {
+        // 오류 본문조차 못 읽으면 상태 코드만으로 충분하다
+      }
+      const aiError = scrubApiKey(
+        `HTTP ${res.status}${detail ? `: ${detail}` : ""}`,
+        apiKey,
+      ).slice(0, 200);
+      logAiFailure("error", aiError);
+      return { status: "error", error: aiError };
+    }
+    let data: {
+      candidates?: { content?: { parts?: { text?: unknown }[] } }[];
+    };
+    try {
+      data = await res.json();
+    } catch {
+      logAiFailure("bad_response", "response_not_json");
+      return { status: "bad_response", error: "response_not_json" };
+    }
     const parts = data?.candidates?.[0]?.content?.parts;
-    if (!Array.isArray(parts)) return null;
+    if (!Array.isArray(parts)) {
+      logAiFailure("bad_response", "no_content_parts");
+      return { status: "bad_response", error: "no_content_parts" };
+    }
     const textOut = parts
       .map((p: { text?: unknown }) =>
         typeof p?.text === "string" ? p.text : ""
       )
       .join("")
       .trim();
-    if (!textOut) return null;
+    if (!textOut) {
+      logAiFailure("bad_response", "empty_model_output");
+      return { status: "bad_response", error: "empty_model_output" };
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(textOut);
     } catch {
-      return null;
+      logAiFailure("bad_response", "model_output_not_json");
+      return { status: "bad_response", error: "model_output_not_json" };
     }
-    if (!Array.isArray(parsed)) return null;
+    if (!Array.isArray(parsed)) {
+      logAiFailure("bad_response", "model_output_not_array");
+      return { status: "bad_response", error: "model_output_not_array" };
+    }
     const out: PlaceCandidate[] = [];
     const seen = new Set<string>();
     for (const item of parsed) {
@@ -816,9 +892,22 @@ async function extractPlacesWithAi(
       });
       if (out.length >= AI_MAX_CANDIDATES) break;
     }
-    return out;
-  } catch {
-    return null;
+    return { status: "ok", candidates: out };
+  } catch (e) {
+    // 타임아웃(AbortController 중단)과 그 밖의 네트워크 오류를 구분한다.
+    const aborted = ctrl.signal.aborted ||
+      (e instanceof Error && e.name === "AbortError");
+    if (aborted) {
+      const aiError = `timeout_after_${GEMINI_TIMEOUT_MS}ms`;
+      logAiFailure("timeout", aiError);
+      return { status: "timeout", error: aiError };
+    }
+    const aiError = scrubApiKey(
+      e instanceof Error ? e.message : String(e),
+      apiKey,
+    ).slice(0, 200);
+    logAiFailure("error", aiError);
+    return { status: "error", error: aiError };
   } finally {
     clearTimeout(timer);
   }
@@ -833,9 +922,14 @@ async function finalizeCandidates(opts: {
   rules: () => PlaceCandidate[];
   pinned?: string[];
   limit: number;
-}): Promise<{ candidates: PlaceCandidate[]; method: "ai" | "rules" }> {
+}): Promise<{
+  candidates: PlaceCandidate[];
+  method: "ai" | "rules";
+  aiStatus: AiStatus;
+  aiError?: string;
+}> {
   const ai = await extractPlacesWithAi(opts.aiText);
-  if (ai) {
+  if (ai.status === "ok") {
     const merged: PlaceCandidate[] = [];
     const seen = new Set<string>();
     for (const raw of opts.pinned ?? []) {
@@ -846,17 +940,23 @@ async function finalizeCandidates(opts: {
       seen.add(key);
       merged.push({ name, likely: true });
     }
-    for (const c of ai) {
+    for (const c of ai.candidates) {
       const key = c.name.replace(/\s+/g, "").toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       merged.push(c);
     }
-    return { candidates: merged.slice(0, opts.limit), method: "ai" };
+    return {
+      candidates: merged.slice(0, opts.limit),
+      method: "ai",
+      aiStatus: "ok",
+    };
   }
   return {
     candidates: opts.rules().slice(0, opts.limit),
     method: "rules",
+    aiStatus: ai.status,
+    ...(ai.error ? { aiError: ai.error } : {}),
   };
 }
 
@@ -920,7 +1020,7 @@ async function extractNaverBlog(url: URL): Promise<ExtractResult> {
       reason: "블로그 본문을 읽지 못했어요. 비공개 글이거나 주소가 잘못됐을 수 있어요.",
     };
   }
-  const { candidates, method } = await finalizeCandidates({
+  const { candidates, method, aiStatus, aiError } = await finalizeCandidates({
     aiText: [title, description, bodyText].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, bodyText),
     limit: 20,
@@ -931,6 +1031,8 @@ async function extractNaverBlog(url: URL): Promise<ExtractResult> {
     candidates,
     source: "naver_blog",
     method,
+    ai_status: aiStatus,
+    ...(aiError ? { ai_error: aiError } : {}),
   };
 }
 
@@ -961,7 +1063,7 @@ async function extractYouTube(url: URL): Promise<ExtractResult> {
       reason: "유튜브 영상 제목을 읽지 못했어요. 삭제됐거나 비공개 영상일 수 있어요.",
     };
   }
-  const { candidates, method } = await finalizeCandidates({
+  const { candidates, method, aiStatus, aiError } = await finalizeCandidates({
     aiText: [title, description].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, description),
     limit: 20,
@@ -972,6 +1074,8 @@ async function extractYouTube(url: URL): Promise<ExtractResult> {
     candidates,
     source: "youtube",
     method,
+    ai_status: aiStatus,
+    ...(aiError ? { ai_error: aiError } : {}),
   };
 }
 
@@ -1092,7 +1196,7 @@ async function extractInstagram(url: URL): Promise<ExtractResult> {
     excludeNames.push(dispM[1].trim(), `${dispM[1].trim()}님`);
   }
   if (embedUsername) excludeNames.push(embedUsername);
-  const { candidates, method } = await finalizeCandidates({
+  const { candidates, method, aiStatus, aiError } = await finalizeCandidates({
     aiText: [
       caption,
       locations.length ? `위치 태그: ${locations.join(", ")}` : "",
@@ -1131,6 +1235,8 @@ async function extractInstagram(url: URL): Promise<ExtractResult> {
     source: "instagram",
     source_detail: useEmbed ? "embed" : "og",
     method,
+    ai_status: aiStatus,
+    ...(aiError ? { ai_error: aiError } : {}),
   };
 }
 
@@ -1147,7 +1253,7 @@ async function extractGeneric(url: URL): Promise<ExtractResult> {
         "페이지 내용을 읽지 못했어요. 로그인 벽이 있거나 주소가 잘못됐을 수 있어요.",
     };
   }
-  const { candidates, method } = await finalizeCandidates({
+  const { candidates, method, aiStatus, aiError } = await finalizeCandidates({
     aiText: [title, description, bodyText].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, bodyText),
     limit: 20,
@@ -1158,6 +1264,8 @@ async function extractGeneric(url: URL): Promise<ExtractResult> {
     candidates,
     source: "web",
     method,
+    ai_status: aiStatus,
+    ...(aiError ? { ai_error: aiError } : {}),
   };
 }
 
