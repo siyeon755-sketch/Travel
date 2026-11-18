@@ -215,6 +215,23 @@
     <!-- 장소 보관함 탭 -->
     <div id="tab-places" class="hidden">
       <div class="card">
+        <h3>🔗 링크 수집함</h3>
+        <p class="muted">유튜브·인스타그램·블로그 링크를 붙여넣으면 게시물에서 장소 후보를 뽑아 드려요. 자동 추출이라 틀린 후보가 섞일 수 있으니, 확인하고 골라서 넣으세요.</p>
+        <label for="linkUrl">링크</label>
+        <input type="url" id="linkUrl" placeholder="https://...">
+        <label for="linkCategory">넣을 때 카테고리</label>
+        <select id="linkCategory">
+          <option>음료</option><option>식사</option><option>디저트</option>
+          <option>카페</option><option>쇼핑</option><option>관광</option>
+          <option>명소</option><option>숙소</option><option>교통</option>
+          <option selected>기타</option>
+        </select>
+        <button id="extractBtn" class="btn-block">읽어오기</button>
+        <p id="extractMsg" class="muted"></p>
+        <div id="extractResult"></div>
+        <div id="linkHistory"></div>
+      </div>
+      <div class="card">
         <h3>장소 추가</h3>
         <label for="plName">장소 이름</label>
         <input type="text" id="plName" placeholder="예: 새턴버드 커피">
@@ -689,6 +706,7 @@ $('addPlanBtn').onclick = async () => {
    장소 보관함 탭
    ============================================================ */
 function renderPlaces() {
+  renderLinkHistory();
   const box = $('placeList');
   if (!state.places.length) {
     box.innerHTML = '<div class="empty">아직 저장한 장소가 없습니다.<br>가고 싶은 장소를 위에 추가해 보세요.</div>';
@@ -745,6 +763,130 @@ $('addPlaceBtn').onclick = async () => {
   if (error) { showError('장소 저장 실패: ' + error.message); return; }
   $('plName').value = ''; $('plMemo').value = '';
   await loadTripData();
+};
+
+/* ============================================================
+   링크 수집함 (장소 보관함 탭 상단)
+   최근 링크는 이 브라우저의 localStorage에만 보관합니다.
+   ============================================================ */
+const LINK_HISTORY_KEY = 'linkInboxHistory';
+let linkInbox = null; // { url, title, candidates: [이름...] }
+
+function loadLinkHistory() {
+  try { return JSON.parse(localStorage.getItem(LINK_HISTORY_KEY)) || []; }
+  catch { return []; }
+}
+
+function saveLinkHistoryItem(item) {
+  const list = loadLinkHistory().filter(h => h.url !== item.url);
+  list.unshift(item);
+  try {
+    localStorage.setItem(LINK_HISTORY_KEY, JSON.stringify(list.slice(0, 10)));
+  } catch { /* 저장 실패는 무시 */ }
+  renderLinkHistory();
+}
+
+function renderLinkHistory() {
+  const box = $('linkHistory');
+  if (!box) return;
+  const list = loadLinkHistory();
+  if (!list.length) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="day-head" style="margin-top:14px">최근에 읽은 링크</div>' +
+    list.map((h, i) => `
+      <div class="item-line">
+        <div class="item-main">
+          <div class="item-title" style="font-size:14px">${esc(h.title || h.url)}</div>
+          <div class="muted">${h.ok ? `후보 ${h.count}개` : '읽기 실패'} · ${esc(new Date(h.at).toLocaleDateString('ko-KR'))}</div>
+        </div>
+        <button class="secondary small" data-link-again="${i}">다시 읽기</button>
+      </div>`).join('');
+  box.querySelectorAll('[data-link-again]').forEach(b => {
+    b.onclick = () => {
+      const item = loadLinkHistory()[Number(b.dataset.linkAgain)];
+      if (!item) return;
+      $('linkUrl').value = item.url;
+      $('extractBtn').click();
+    };
+  });
+}
+
+function renderExtractResult() {
+  const box = $('extractResult');
+  if (!linkInbox) { box.innerHTML = ''; return; }
+  const { title, candidates } = linkInbox;
+  if (!candidates.length) {
+    box.innerHTML = `<p class="muted" style="margin-top:10px">「${esc(title)}」에서 장소 후보를 찾지 못했어요. 아래 장소 추가에서 직접 입력해 주세요.</p>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="day-head">「${esc(title)}」에서 찾은 후보</div>
+    ${candidates.map((name, i) => `
+      <div class="checkline">
+        <input type="checkbox" id="cand-${i}" data-cand="${i}" checked>
+        <label for="cand-${i}" class="item-main" style="margin:0">${esc(name)}</label>
+      </div>`).join('')}
+    <button id="addCandsBtn" class="btn-block" style="margin-top:10px">선택한 장소 보관함에 넣기</button>`;
+  $('addCandsBtn').onclick = addSelectedCandidates;
+}
+
+async function addSelectedCandidates() {
+  const checked = [...document.querySelectorAll('[data-cand]')].filter(c => c.checked);
+  if (!checked.length) { showError('넣을 장소를 하나 이상 골라 주세요.'); return; }
+  showError('');
+  const memo = `출처: ${linkInbox.title} ${linkInbox.url}`;
+  const rows = checked.map(c => ({
+    trip_id: state.trip.id,
+    name: linkInbox.candidates[Number(c.dataset.cand)],
+    category: $('linkCategory').value,
+    memo,
+    created_by: state.user.id,
+  }));
+  const { error } = await sb.from('saved_places').insert(rows);
+  if (error) { showError('장소 넣기 실패: ' + error.message); return; }
+  linkInbox = null;
+  renderExtractResult();
+  $('extractMsg').textContent = `${rows.length}곳을 장소 보관함에 넣었어요.`;
+  await loadTripData();
+}
+
+$('extractBtn').onclick = async () => {
+  const url = $('linkUrl').value.trim();
+  if (!url) { showError('링크를 입력하세요.'); return; }
+  if (!sb) { showError('Supabase 설정이 필요합니다. README.md를 확인하세요.'); return; }
+  showError('');
+  linkInbox = null;
+  renderExtractResult();
+  const btn = $('extractBtn');
+  btn.disabled = true;
+  btn.textContent = '읽는 중...';
+  $('extractMsg').textContent = '';
+  try {
+    const { data, error } = await sb.functions.invoke('extract-places', { body: { url } });
+    if (error) throw error;
+    if (!data?.ok) {
+      $('extractMsg').textContent =
+        (data?.reason || '게시물을 읽지 못했어요.') + ' 아래 장소 추가에서 직접 입력해 주세요.';
+      saveLinkHistoryItem({ url, title: '', ok: false, count: 0, at: Date.now() });
+      return;
+    }
+    linkInbox = {
+      url,
+      title: data.title || url,
+      candidates: (data.candidates || []).map(c => c.name).filter(Boolean),
+    };
+    renderExtractResult();
+    saveLinkHistoryItem({
+      url, title: linkInbox.title, ok: true,
+      count: linkInbox.candidates.length, at: Date.now(),
+    });
+  } catch (e) {
+    $('extractMsg').textContent =
+      '링크 읽기에 실패했어요. 추출 함수(extract-places)가 Supabase에 배포돼 있는지 확인해 주세요. (EDGE-FUNCTION.md 참고) 장소는 아래에서 직접 입력할 수 있어요.';
+    saveLinkHistoryItem({ url, title: '', ok: false, count: 0, at: Date.now() });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '읽어오기';
+  }
 };
 
 /* ============================================================
