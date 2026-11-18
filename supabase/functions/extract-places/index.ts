@@ -692,7 +692,12 @@ function geminiModel(): string {
 function geminiEndpoint(): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel()}:generateContent`;
 }
-const GEMINI_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_MS = 20000;
+// 일시 오류(HTTP 503·429)나 타임아웃이면 잠깐 쉬고 1회만 재시도한다.
+// 그래도 실패하면 호출부가 규칙 기반으로 폴백하고, ai_status/ai_error에는
+// 마지막 시도의 원인이 기록된다.
+const GEMINI_RETRY_DELAY_MS = 1500;
+const GEMINI_MAX_ATTEMPTS = 2;
 const AI_TEXT_LIMIT = 6000; // AI에 보낼 본문 최대 길이
 const AI_MAX_CANDIDATES = 15;
 
@@ -788,9 +793,14 @@ function logAiFailure(status: AiStatus, error?: string): void {
   );
 }
 
-// Gemini에 본문을 보내 장소 후보를 받는다. 키가 없거나 호출
-// 실패/타임아웃/파싱 실패면 status로 원인을 구분해 돌려주고,
-// 호출부가 규칙 기반으로 폴백한다.
+// 1회 시도 결과. httpStatus는 재시도 여부 판단에만 쓰고,
+// 바깥으로 내보내는 AiOutcome에는 포함하지 않는다.
+type AiAttemptOutcome = AiOutcome & { httpStatus?: number };
+
+// Gemini에 본문을 보내 장소 후보를 받는다. 키가 없으면 바로
+// no_key를 돌려주고, 일시 오류(503·429·타임아웃)면 1회 재시도한다.
+// 끝내 실패하면 status로 원인을 구분해 돌려주고, 호출부가
+// 규칙 기반으로 폴백한다.
 async function extractPlacesWithAi(
   text: string,
 ): Promise<AiOutcome> {
@@ -805,6 +815,27 @@ async function extractPlacesWithAi(
     return { status: "error", error: "empty_text" };
   }
 
+  let lastOutcome: AiOutcome = { status: "error", error: "not_attempted" };
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+    const outcome = await attemptExtractPlacesWithAi(clipped, apiKey);
+    if (outcome.status === "ok") return outcome;
+    const { httpStatus, ...rest } = outcome;
+    lastOutcome = rest;
+    const retryable = outcome.status === "timeout" || httpStatus === 503 ||
+      httpStatus === 429;
+    if (!retryable || attempt >= GEMINI_MAX_ATTEMPTS) break;
+    await new Promise((resolve) =>
+      setTimeout(resolve, GEMINI_RETRY_DELAY_MS)
+    );
+  }
+  return lastOutcome;
+}
+
+// 실제 Gemini 호출 1회. 타임아웃은 시도마다 새로 건다.
+async function attemptExtractPlacesWithAi(
+  clipped: string,
+  apiKey: string,
+): Promise<AiAttemptOutcome> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
   try {
@@ -849,7 +880,7 @@ async function extractPlacesWithAi(
         apiKey,
       ).slice(0, 200);
       logAiFailure("error", aiError);
-      return { status: "error", error: aiError };
+      return { status: "error", error: aiError, httpStatus: res.status };
     }
     let data: {
       candidates?: { content?: { parts?: { text?: unknown }[] } }[];
