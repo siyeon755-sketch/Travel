@@ -10,6 +10,11 @@
 //
 // 인증: Verify JWT 기본값(켜짐) 유지 전제. 로그인한 사용자만
 // 호출할 수 있고, 이 함수 안에서 별도 JWT 검사는 하지 않습니다.
+//
+// 보안 (SSRF 방지): 사용자가 넣은 URL을 서버가 그대로 가져오면
+// 내부/사설 주소로 요청을 보내는 공격이 가능하므로, 가져올 수 있는
+// 사이트를 허용 목록(ALLOWED_HOSTS)으로 제한합니다. 리다이렉트는
+// 자동 추종하지 않고 매 이동마다 같은 검사를 다시 적용합니다.
 // ============================================================
 
 const corsHeaders = {
@@ -257,23 +262,158 @@ function extractCandidates(title, description, bodyText) {
     .map((v) => ({ name: v.name }));
 }
 
+// === SSRF 방지: 허용 사이트 제한 ===
+// 읽을 수 있는 호스트는 아래 목록뿐이다. 목록에 없으면 가져오지 않는다.
+const ALLOWED_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "music.youtube.com",
+  "youtu.be",
+  "instagram.com",
+  "www.instagram.com",
+  "blog.naver.com",
+  "m.blog.naver.com",
+]);
+
+const UNSUPPORTED_SITE_REASON =
+  "지원하지 않는 사이트예요. 유튜브·인스타그램·네이버 블로그 링크만 읽을 수 있어요.";
+
+function isIpLiteralHost(hostname) {
+  if (!hostname) return true;
+  if (hostname.startsWith("[")) return true; // IPv6 리터럴 ([::1] 등)
+  // IPv4 리터럴. URL 파서가 2130706433, 0x7f000001 같은 우회 표기도
+  // 127.0.0.1 형태의 점표기로 정규화해 주므로 이 검사로 함께 걸러진다.
+  // (localhost, 127.0.0.1, 169.254.169.254, 사설/예약 대역 전부 포함)
+  if (/^\d{1,3}(\.\d{1,3}){3}\.?$/.test(hostname)) return true;
+  return false;
+}
+
+// fetch 대상 URL 검사. 통과하면 { ok: true, url }, 아니면
+// { ok: false, reason } 을 돌려준다. 처음 주소뿐 아니라 리다이렉트로
+// 도착한 주소에도 매번 이 검사를 적용해야 한다.
+function validateFetchUrl(raw) {
+  let url;
+  try {
+    url = raw instanceof URL ? raw : new URL(String(raw));
+  } catch {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  // http/https 만 허용
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  // 주소에 사용자정보(user:pass@)가 있으면 거부
+  if (url.username || url.password) {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  // 포트 지정 거부. 기본 포트(80/443)는 URL 파서가 자동으로 비워
+  // 주므로, 포트가 남아 있으면 비표준 포트를 지정한 것이다.
+  if (url.port) {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  const host = url.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    isIpLiteralHost(host)
+  ) {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  if (!ALLOWED_HOSTS.has(host)) {
+    return { ok: false, reason: UNSUPPORTED_SITE_REASON };
+  }
+  return { ok: true, url };
+}
+
 // === EXTRACT LOGIC END ===
 
-async function fetchText(url: string, timeoutMs = 12000): Promise<string> {
+// 허용 목록 검사에서 막힌 경우를 구분하기 위한 에러.
+// 핸들러에서 이 에러는 "지원하지 않는 사이트" 안내로 그대로 돌려준다.
+class BlockedUrlError extends Error {}
+
+const MAX_REDIRECTS = 5;
+const MAX_BODY_BYTES = 2 * 1024 * 1024; // 응답 크기 상한 2MB
+
+async function readBodyWithCap(
+  res: Response,
+  maxBytes: number,
+): Promise<string> {
+  const declared = Number(res.headers.get("content-length") ?? 0);
+  if (declared > maxBytes) {
+    throw new Error("페이지가 너무 커서 읽기를 중단했어요.");
+  }
+  if (!res.body) {
+    const text = await res.text();
+    if (text.length > maxBytes) {
+      throw new Error("페이지가 너무 커서 읽기를 중단했어요.");
+    }
+    return text;
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch { /* 무시 */ }
+        throw new Error("페이지가 너무 커서 읽기를 중단했어요.");
+      }
+      chunks.push(value);
+    }
+  }
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8").decode(buf);
+}
+
+// SSRF 방지 fetch:
+// - 처음 주소와 리다이렉트로 도착하는 주소 모두 validateFetchUrl로
+//   검사한 뒤에만 요청한다 (허용 목록 밖이면 BlockedUrlError).
+// - 리다이렉트는 자동 추종(redirect: "follow")을 쓰지 않고 최대
+//   MAX_REDIRECTS회까지 직접 따라간다.
+// - 전체 시간(timeoutMs)과 응답 크기(MAX_BODY_BYTES)에 상한이 있다.
+async function fetchText(rawUrl: string, timeoutMs = 10000): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": BROWSER_UA,
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      redirect: "follow",
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
+    let current = rawUrl;
+    for (let hop = 0; ; hop++) {
+      const gate = validateFetchUrl(current);
+      if (!gate.ok) throw new BlockedUrlError(gate.reason);
+      const res = await fetch(gate.url.toString(), {
+        headers: {
+          "User-Agent": BROWSER_UA,
+          "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+          Accept: "text/html,application/xhtml+xml",
+        },
+        redirect: "manual",
+        signal: ctrl.signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get("location");
+        try {
+          await res.body?.cancel();
+        } catch { /* 무시 */ }
+        if (!location) throw new Error(`HTTP ${res.status}`);
+        if (hop >= MAX_REDIRECTS) {
+          throw new Error("리다이렉트가 너무 많아요.");
+        }
+        current = new URL(location, gate.url).toString();
+        continue;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await readBodyWithCap(res, MAX_BODY_BYTES);
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -450,9 +590,15 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ok: false, reason: "url이 필요합니다." }, 400);
     }
     url = new URL(body.url.trim());
-    if (!/^https?:$/.test(url.protocol)) throw new Error("protocol");
   } catch {
     return jsonResponse({ ok: false, reason: "올바른 링크 주소를 넣어 주세요." }, 400);
+  }
+
+  // SSRF 방지: 허용 목록에 있는 사이트만 읽는다. 여기서 막히면
+  // 어떤 fetch도 일어나지 않는다.
+  const gate = validateFetchUrl(url);
+  if (!gate.ok) {
+    return jsonResponse({ ok: false, reason: gate.reason });
   }
 
   try {
@@ -468,6 +614,11 @@ Deno.serve(async (req: Request) => {
     }
     return jsonResponse(result);
   } catch (e) {
+    // 리다이렉트 등으로 허용 목록 밖 주소에 닿은 경우: 가져오기 실패가
+    // 아니라 "지원하지 않는 사이트" 안내로 솔직히 돌려준다.
+    if (e instanceof BlockedUrlError) {
+      return jsonResponse({ ok: false, reason: e.message });
+    }
     const msg = e instanceof Error ? e.message : String(e);
     return jsonResponse({
       ok: false,
