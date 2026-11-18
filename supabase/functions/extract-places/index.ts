@@ -5,8 +5,9 @@
 // 규칙 기반으로 뽑아 돌려줍니다. (브라우저는 CORS 때문에 외부
 // 페이지를 직접 읽을 수 없어서 서버에서 가져옵니다.)
 //
-// 반환: { ok: true, title, candidates: [{ name }], source }
+// 반환: { ok: true, title, candidates: [{ name, likely }], source }
 //       { ok: false, reason }
+//   likely=true인 후보만 화면에서 기본 체크된다.
 //
 // 인증: Verify JWT 기본값(켜짐) 유지 전제. 로그인한 사용자만
 // 호출할 수 있고, 이 함수 안에서 별도 JWT 검사는 하지 않습니다.
@@ -103,6 +104,49 @@ const PLACE_STOPWORDS = new Set([
   "카페 메뉴", "구매샷", "매장명", "영업시간", "커피", "칵테일", "메뉴판",
   "요즘", "인스타", "공구", "동결건조", "루프탑", "루프탑바", "이날",
   "해피아워",
+  // 인스타그램 캡션/해시태그에서 흔한 일반어
+  "저장", "공유", "일상", "모음집", "재방문", "다녀온", "진짜", "너무",
+  "너무너무", "세번동안", "두번이상", "맛집들", "좋아요", "팔로우",
+  "프로필", "여행스타그램", "먹스타그램", "카페스타그램", "여행에미치다",
+  "fyp", "reels", "viral", "foryou", "foryoupage", "explore",
+  "travel", "foodie", "instatravel", "instagood", "daily",
+  // 도시 이름 단독은 장소가 아니다 (한자/영문 표기 포함)
+  "上海", "北京", "广州", "深圳", "成都", "重庆", "西安", "杭州",
+  "南京", "苏州", "武汉", "天津", "长沙", "厦门", "香港", "台北",
+  "东京", "大阪", "京都", "首尔", "曼谷", "河内", "岘港",
+  "shanghai", "beijing", "seoul", "tokyo", "osaka", "bangkok",
+  "hanoi", "danang", "hongkong", "taipei",
+]);
+
+// 해시태그에 이 조각이 포함되면 장소명이 아니라고 본다
+// (예: 상하이맛집, 상하이여행, 카페추천, 일상기록 등)
+const HASHTAG_GENERIC_PARTS = [
+  "맛집", "여행", "추천", "일상", "공유", "저장", "브이로그", "스타그램",
+  "투어", "코스", "일정", "후기", "정보", "꿀팁", "핫플", "데이트",
+  "먹방", "쇼핑", "모음", "재방문", "다녀온", "가볼만한", "핫플레이스",
+  "먹스타", "기록", "소개", "총정리", "리스트",
+];
+
+// 라틴 문자만으로 된 해시태그 중 일반어 (대문자로 시작해도 제외)
+const EN_GENERIC_TAGS = new Set([
+  "travel", "foodie", "cafe", "hotel", "trip", "daily", "love",
+  "happy", "photo", "video", "reels", "viral", "explore", "instagood",
+  "beautiful", "wanderlust", "food", "foodporn", "yummy", "delicious",
+  "breakfast", "lunch", "dinner", "coffee", "dessert", "shopping",
+  "fashion", "ootd", "selfie", "nature", "sunset", "beach", "summer",
+]);
+
+// 도시 이름 단독 (해시태그 판정용, 한자 표기)
+const CJK_CITY_NAMES = new Set([
+  "上海", "北京", "广州", "深圳", "成都", "重庆", "西安", "杭州",
+  "南京", "苏州", "武汉", "天津", "长沙", "厦门", "香港", "台北",
+  "东京", "大阪", "京都", "首尔", "曼谷", "河内", "岘港",
+]);
+
+// 중국어 접미사 중 상호/시설 이름일 가능성이 특히 높은 것
+const STRONG_CJK_SUFFIXES = new Set([
+  "博物馆", "美术馆", "图书馆", "古镇", "夜市", "市场", "广场", "中心",
+  "商场", "商城", "大厦", "酒店", "餐厅", "咖啡", "书店", "公园", "店",
 ]);
 
 // 한국어 장소 접미사 규칙에서 제외할 일반어
@@ -136,7 +180,9 @@ function isValidCandidate(s) {
   if (!s) return false;
   const len = [...s].length;
   if (len < 2 || len > 25) return false;
-  if (PLACE_STOPWORDS.has(s)) return false;
+  if (PLACE_STOPWORDS.has(s) || PLACE_STOPWORDS.has(s.toLowerCase())) {
+    return false;
+  }
   if (/https?:\/\//.test(s) || s.includes("@")) return false;
   if (/^\d+$/.test(s)) return false; // 숫자만
   if (/^\d{1,4}[.\-/년월일\s]*$/.test(s)) return false; // 날짜만
@@ -145,26 +191,110 @@ function isValidCandidate(s) {
   // camelCase 영문 식별자(페이지 설정값 등 코드 잡음) 제외
   if (/^[A-Za-z]+$/.test(s) && /[a-z][A-Z]/.test(s)) return false;
   // 한국어 문장처럼 보이는 것 제외 (조사/어미로 끝나는 긴 구)
-  if (/(입니다|합니다|했어요|같아요|이에요|예요|네요|거예요)\.?$/.test(s) && len > 6) {
+  if (
+    /(입니다|합니다|했어요|같아요|이에요|예요|어요|해요|세요|있어요|돼요|네요|거예요|니다)\.?$/
+      .test(s) && len > 6
+  ) {
     return false;
   }
   return true;
 }
 
+// 해시태그는 장소 고유명사 패턴에 강하게 맞을 때만 남긴다.
+// (인스타그램에서 해시태그는 일반어 잡음의 주범이라 엄격히 거른다)
+const KOR_HASHTAG_SUFFIX_RE =
+  /(?:박물관|미술관|백화점|공원|시장|광장|타워|거리|랜드|월드|센터|대교|호수|사원|성당|궁전|역|몰|루|사|항|섬|산)$/;
+
+// 어떤 경우에도 해시태그 후보가 될 수 없는 일반어인가
+function isHardBlockedHashtag(t) {
+  if (!t) return true;
+  if (PLACE_STOPWORDS.has(t) || PLACE_STOPWORDS.has(t.toLowerCase())) {
+    return true;
+  }
+  if (KOR_SUFFIX_EXCLUDES.has(t)) return true;
+  for (const part of HASHTAG_GENERIC_PARTS) {
+    if (t.includes(part)) return true;
+  }
+  if (/[0-9]/.test(t) && !/[一-鿿]/.test(t)) return true; // 숫자 섞인 태그
+  return false;
+}
+
+function isPlaceLikeHashtag(tag) {
+  const t = String(tag ?? "").trim();
+  if (isHardBlockedHashtag(t)) return false;
+  // 한자 포함: 도시명 단독이 아니고 중국어 장소 접미사로 끝날 때만
+  if (/[一-鿿]/.test(t)) {
+    if (CJK_CITY_NAMES.has(t)) return false;
+    return [...t].length >= 3 && CJK_SUFFIXES.some((suf) => t.endsWith(suf));
+  }
+  // 한국어: 장소 접미사로 끝나고 3자 이상일 때만
+  if (/[가-힣]/.test(t)) {
+    return [...t].length >= 3 && KOR_HASHTAG_SUFFIX_RE.test(t);
+  }
+  // 라틴 문자만: 대문자로 시작하는 고유명사형만 (Flair, Saturnbird 등).
+  // 전부 소문자인 태그(shanghai, fyp, reels 등)는 일반 태그라 제외.
+  if (/^[A-Z][A-Za-z]{3,}$/.test(t)) {
+    return !EN_GENERIC_TAGS.has(t.toLowerCase());
+  }
+  return false;
+}
+
+// 패턴에는 안 걸리지만 본문(해시태그를 뺀 캡션)에도 등장하는 해시태그는
+// 작성자가 본문에서 이름으로 쓴 고유명사일 가능성이 있다 (예: #예원,
+// #미샹프라다롱자이). 일반어 차단은 그대로 적용하고, 점수는 최하위로
+// 매겨 likely:false 로만 허용한다.
+function isBodyMentionedHashtag(tag, bodyFlat) {
+  const t = String(tag ?? "").trim();
+  if (isHardBlockedHashtag(t)) return false;
+  if (!/[가-힣一-鿿]/.test(t)) return false; // 한국어/한자 태그만
+  if (/[一-鿿]/.test(t) && CJK_CITY_NAMES.has(t)) return false;
+  if ([...t].length < 2) return false;
+  return bodyFlat.includes(t);
+}
+
 // 제목/설명/본문에서 장소 후보를 규칙 기반으로 추출.
-// 반환: [{ name }] (점수 높은 순, 최대 20개)
-function extractCandidates(title, description, bodyText) {
-  const scores = new Map(); // 정규화 키 -> { name, score, order }
+// 반환: [{ name, likely }] (점수 높은 순)
+//   likely: 위치 태그·표시 줄·따옴표/병기·명확한 상호 패턴처럼
+//           장소일 가능성이 높은 후보에 true. 화면에서 기본 체크용.
+// options:
+//   source: "instagram" 이면 인스타그램 모드. 캡션 일반어가 워낙 많아
+//           제목 토큰/단어 빈도 규칙을 끄고 해시태그를 엄격히 거른다.
+//   username / excludeNames: 계정명과 그 파편을 후보에서 제외한다.
+function extractCandidates(title, description, bodyText, options = {}) {
+  const igMode = options.source === "instagram";
+  const usernameKey = String(options.username ?? "")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+  const excludeKeys = new Set(
+    (options.excludeNames ?? []).map((n) =>
+      String(n).replace(/\s+/g, "").toLowerCase()
+    ),
+  );
+
+  const scores = new Map(); // 정규화 키 -> { name, score, order, likely }
   let order = 0;
-  const add = (raw, score) => {
+  const add = (raw, score, likely = false) => {
     const name = cleanCandidate(raw);
     if (!isValidCandidate(name)) return;
     const key = name.replace(/\s+/g, "").toLowerCase();
+    if (igMode) {
+      // "Instagram의 ~님" 같은 계정 표기 자체는 장소가 아니다
+      if (/instagram/i.test(name)) return;
+      if (excludeKeys.has(key)) return;
+      // 계정명 본인(imsosozip)이나 그 파편(soso, soso님) 제외
+      if (usernameKey) {
+        const base = key.replace(/님$/, "");
+        if (key === usernameKey) return;
+        if (base.length >= 3 && usernameKey.includes(base)) return;
+        if (key.length >= 3 && usernameKey.includes(key)) return;
+      }
+    }
     const prev = scores.get(key);
     if (prev) {
       if (score > prev.score) prev.score = score;
+      if (likely) prev.likely = true;
     } else {
-      scores.set(key, { name, score, order: order++ });
+      scores.set(key, { name, score, order: order++, likely: !!likely });
     }
   };
 
@@ -173,9 +303,19 @@ function extractCandidates(title, description, bodyText) {
   const body = String(bodyText ?? "").slice(0, 30000);
 
   // 1) 따옴표/꺾쇠 안 이름
+  //    인스타그램 제목("Instagram의 ~님 : ...")은 계정 표기라 건너뛴다.
   const quoteRe = /["“”「『]([^"“”」』\n]{2,25})["“”」』]/g;
-  for (const [text, sc] of [[titleText, 70], [descText, 55], [body, 45]]) {
-    for (const m of text.matchAll(quoteRe)) add(m[1], sc);
+  const quoteTexts = igMode
+    ? [[descText, 55], [body, 45]]
+    : [[titleText, 70], [descText, 55], [body, 45]];
+  for (const [text, sc] of quoteTexts) {
+    for (const m of text.matchAll(quoteRe)) {
+      // 인스타그램에서 따옴표 구간은 캡션 첫 문장인 경우가 많아,
+      // 일반어 조각이 섞인 문구는 likely에서 내린다
+      const likelyQuote = !igMode ||
+        !HASHTAG_GENERIC_PARTS.some((p) => m[1].includes(p));
+      add(m[1], sc, likelyQuote);
+    }
   }
 
   // 2) 한국어 이름 + (중국어) 병기 패턴: 새턴버드(三顿半) → 둘 다 후보
@@ -183,34 +323,77 @@ function extractCandidates(title, description, bodyText) {
     /([가-힣A-Za-z0-9][가-힣A-Za-z0-9&·\s]{0,18}?)\s*[\(（]([一-鿿·\s]{2,20})[\)）]/g;
   for (const text of [titleText, descText, body]) {
     for (const m of text.matchAll(parenRe)) {
-      add(m[1], 60);
-      add(m[2].replace(/\s+/g, ""), 40);
+      add(m[1], 60, true);
+      add(m[2].replace(/\s+/g, ""), 40, true);
     }
   }
 
   // 3) 제목/설명을 구분자로 나눈 토큰 (괄호 병기는 2번 규칙이 따로 처리)
-  const delimRe = /\s*[|·•\/>»—–:,\-]\s*/;
-  for (const [text, sc] of [[titleText, 50], [descText, 35]]) {
-    for (const tok of text.split(delimRe)) {
-      if (/[\(\)（）]/.test(tok)) continue;
-      add(tok, sc);
+  //    인스타그램 제목/설명은 계정명·좋아요 수 같은 잡음뿐이라 제외.
+  if (!igMode) {
+    const delimRe = /\s*[|·•\/>»—–:,\-]\s*/;
+    for (const [text, sc] of [[titleText, 50], [descText, 35]]) {
+      for (const tok of text.split(delimRe)) {
+        if (/[\(\)（）]/.test(tok)) continue;
+        add(tok, sc, sc >= 50);
+      }
     }
   }
 
-  // 4) 해시태그
-  const hashRe = /#([^\s#]{2,20})/g;
-  for (const text of [descText, body]) {
-    for (const m of text.matchAll(hashRe)) add(m[1], 30);
+  // 3-1) 표시 줄: 📍/🏩 마커가 붙은 줄, "위치: ~" 라벨 줄.
+  //      인스타그램 캡션에서 장소 신호가 가장 강한 형태다.
+  const bodyLines = body.split("\n");
+  for (let i = 0; i < bodyLines.length; i++) {
+    const t = bodyLines[i].trim();
+    if (!t) continue;
+    const labelM = t.match(/^(?:위치|주소|장소)\s*[:：]\s*(.{2,30})$/);
+    if (labelM) {
+      add(labelM[1], 90, true);
+      continue;
+    }
+    const emoM = t.match(/^(?:📍|📌|🏩|🚩)\s*(.{2,30})$/);
+    if (emoM) {
+      add(emoM[1], 90, true);
+      continue;
+    }
+    // 마커만 있는 줄이면 다음 줄이 장소인 경우가 많다
+    if (/^(?:📍|📌|🏩|🚩)+$/.test(t)) {
+      for (let j = i + 1; j < bodyLines.length; j++) {
+        const nt = bodyLines[j].trim();
+        if (nt) {
+          add(nt, 90, true);
+          break;
+        }
+      }
+    }
   }
 
-  // 5) 중국어 지점/장소 패턴: 한자 연속 + 장소 접미사
+  // 4) 해시태그. 인스타그램에서는 고유명사 패턴에 강하게 맞을 때만.
+  //    패턴에 안 걸려도 본문에 이름으로 등장하면 최하위 점수로 허용.
+  const bodyFlat = igMode
+    ? body.replace(/#[^\s#]+/g, " ").replace(/\s+/g, "")
+    : "";
+  const hashRe = /#([^\s#]{2,20})/g;
+  for (const text of [descText, body]) {
+    for (const m of text.matchAll(hashRe)) {
+      if (igMode) {
+        if (isPlaceLikeHashtag(m[1])) add(m[1], 45, false);
+        else if (isBodyMentionedHashtag(m[1], bodyFlat)) add(m[1], 15, false);
+      } else {
+        add(m[1], 30, false);
+      }
+    }
+  }
+
+  // 5) 중국어 지점/장소 패턴: 한자 연속 + 장소 접미사.
+  //    상호·시설 접미사(店·广场·中心 등)로 끝나면 likely.
   const cjkRunRe = /[一-鿿]{2,16}/g;
   for (const text of [titleText, descText, body]) {
     for (const m of text.matchAll(cjkRunRe)) {
       const run = m[0];
       for (const suf of CJK_SUFFIXES) {
         if (run.endsWith(suf)) {
-          add(run.slice(-12), 38);
+          add(run.slice(-12), 38, STRONG_CJK_SUFFIXES.has(suf));
           break;
         }
       }
@@ -221,51 +404,77 @@ function extractCandidates(title, description, bodyText) {
   const korSuffixRe = /[가-힣]{2,10}?(?:박물관|미술관|백화점|공원|시장|광장|타워|거리|역|사|루|몰)/g;
   for (const text of [titleText, descText, body]) {
     for (const m of text.matchAll(korSuffixRe)) {
-      if (!KOR_SUFFIX_EXCLUDES.has(m[0])) add(m[0], 25);
+      if (!KOR_SUFFIX_EXCLUDES.has(m[0])) add(m[0], 25, false);
     }
   }
 
-  // 7) 제목형 줄만: "1. 이름", "매장명 : 이름" 같은 형태
-  for (const line of body.split("\n")) {
-    const t = line.trim();
-    if (!t || [...t].length > 40) continue;
-    const label = t.match(/^[^:：]{1,10}[:：]\s*(.{2,25})$/);
-    if (label && !/[\(\)（）]/.test(label[1])) add(label[1], 20);
-    const numbered = t.match(/^\d{1,2}[.)]\s*(.{2,25})$/);
-    if (numbered && !/(다|요|네요)[.!?。]?\s*$/.test(numbered[1])) {
-      add(numbered[1], 18);
+  // 7) 제목형 줄: "1. 이름", "매장명 : 이름" 같은 형태 (인스타그램 제외)
+  if (!igMode) {
+    for (const line of bodyLines) {
+      const t = line.trim();
+      if (!t || [...t].length > 40) continue;
+      const label = t.match(/^[^:：]{1,10}[:：]\s*(.{2,25})$/);
+      if (label && !/[\(\)（）]/.test(label[1])) add(label[1], 20, false);
+      const numbered = t.match(/^\d{1,2}[.)]\s*(.{2,25})$/);
+      if (numbered && !/(다|요|네요)[.!?。]?\s*$/.test(numbered[1])) {
+        add(numbered[1], 18, false);
+      }
     }
   }
 
-  // 8) 단어 빈도: 제목 단어 + 본문/설명에서 2번 이상 반복되는 단어
-  const badEnding =
-    /(은|는|이|가|을|를|의|에|와|과|로|으로|에서|부터|까지|처럼|보다|다|요|함|음|임|데|고|까|죠|네|며|서|한|인|적|것|때|수|등|중|도|야|게|쯤|던)$/;
-  const wordCounts = new Map();
-  const tokenize = (text) =>
-    String(text ?? "")
-      .split(/[^\w가-힣一-鿿]+/)
-      .map((w) => w.trim())
-      .filter(Boolean);
-  for (const w of tokenize(titleText)) {
-    if ([...w].length < 2 || [...w].length > 10) continue;
-    if (badEnding.test(w)) continue;
-    add(w, 30);
-  }
-  for (const w of tokenize(descText + " " + body)) {
-    if (/[一-鿿]/.test(w)) continue; // 한자는 5번 규칙이 담당
-    wordCounts.set(w, (wordCounts.get(w) ?? 0) + 1);
-  }
-  for (const [w, cnt] of wordCounts) {
-    if (cnt < 2) continue;
-    if ([...w].length < 2 || [...w].length > 10) continue;
-    if (badEnding.test(w)) continue;
-    add(w, cnt >= 3 ? 28 : 22);
+  // 8) 단어 빈도: 제목 단어 + 본문/설명에서 2번 이상 반복되는 단어.
+  //    인스타그램 캡션에서는 일반어 잡음의 주범이라 끈다.
+  if (!igMode) {
+    const badEnding =
+      /(은|는|이|가|을|를|의|에|와|과|로|으로|에서|부터|까지|처럼|보다|다|요|함|음|임|데|고|까|죠|네|며|서|한|인|적|것|때|수|등|중|도|야|게|쯤|던)$/;
+    const wordCounts = new Map();
+    const tokenize = (text) =>
+      String(text ?? "")
+        .split(/[^\w가-힣一-鿿]+/)
+        .map((w) => w.trim())
+        .filter(Boolean);
+    for (const w of tokenize(titleText)) {
+      if ([...w].length < 2 || [...w].length > 10) continue;
+      if (badEnding.test(w)) continue;
+      add(w, 30, false);
+    }
+    for (const w of tokenize(descText + " " + body)) {
+      if (/[一-鿿]/.test(w)) continue; // 한자는 5번 규칙이 담당
+      wordCounts.set(w, (wordCounts.get(w) ?? 0) + 1);
+    }
+    for (const [w, cnt] of wordCounts) {
+      if (cnt < 2) continue;
+      if ([...w].length < 2 || [...w].length > 10) continue;
+      if (badEnding.test(w)) continue;
+      add(w, cnt >= 3 ? 28 : 22, false);
+    }
   }
 
-  return [...scores.values()]
-    .sort((a, b) => b.score - a.score || a.order - b.order)
-    .slice(0, 20)
-    .map((v) => ({ name: v.name }));
+  let results = [...scores.values()]
+    .sort((a, b) => b.score - a.score || a.order - b.order);
+  if (igMode) {
+    // 부분 문자열 관계인 중복 후보 정리 (디즈니랜드 vs 상하이디즈니랜드).
+    // 점수가 같으면 더 긴(구체적인) 이름을 남긴다.
+    const keyOf = (v) => v.name.replace(/\s+/g, "").toLowerCase();
+    const byPref = [...results].sort((a, b) =>
+      b.score - a.score || keyOf(b).length - keyOf(a).length ||
+      a.order - b.order
+    );
+    const keptKeys = [];
+    const drop = new Set();
+    for (const v of byPref) {
+      const k = keyOf(v);
+      if (keptKeys.some((u) => u.includes(k) || k.includes(u))) {
+        drop.add(v);
+      } else {
+        keptKeys.push(k);
+      }
+    }
+    results = results.filter((v) => !drop.has(v));
+  }
+  return results
+    .slice(0, igMode ? 12 : 20)
+    .map((v) => ({ name: v.name, likely: !!v.likely }));
 }
 
 // === SSRF 방지: 허용 사이트 제한 ===
@@ -433,7 +642,7 @@ type ExtractResult =
   | {
     ok: true;
     title: string;
-    candidates: { name: string }[];
+    candidates: { name: string; likely?: boolean }[];
     source: string;
     source_detail?: string;
   }
@@ -651,21 +860,37 @@ async function extractInstagram(url: URL): Promise<ExtractResult> {
     : embedUsername
     ? `인스타그램 게시물 (@${embedUsername})`
     : "인스타그램 게시물";
-  const candidates = extractCandidates(ogTitle, ogDescription, caption);
-  // 위치 태그는 실제 장소일 가능성이 가장 높아 맨 앞에 둔다
+  // 제목의 "Instagram의 ~님" 표기에서 표시 이름을 뽑아 계정 파편
+  // 제외 목록에 넣는다 (예: "soso님", "soso")
+  const excludeNames: string[] = [];
+  const dispM = ogTitle.match(/Instagram의\s+(.+?)님/);
+  if (dispM) {
+    excludeNames.push(dispM[1].trim(), `${dispM[1].trim()}님`);
+  }
+  if (embedUsername) excludeNames.push(embedUsername);
+  const candidates = extractCandidates(ogTitle, ogDescription, caption, {
+    source: "instagram",
+    username: embedUsername,
+    excludeNames,
+  });
+  // 위치 태그는 실제 장소일 가능성이 가장 높아 맨 앞에 두고 likely로 표시
   for (const loc of [...locations].reverse()) {
     const name = cleanCandidate(loc);
-    if (
-      isValidCandidate(name) &&
-      !candidates.some((c) => c.name.replace(/\s+/g, "") === name.replace(/\s+/g, ""))
-    ) {
-      candidates.unshift({ name });
+    if (!isValidCandidate(name)) continue;
+    const key = name.replace(/\s+/g, "").toLowerCase();
+    const existing = candidates.find(
+      (c) => c.name.replace(/\s+/g, "").toLowerCase() === key,
+    );
+    if (existing) {
+      existing.likely = true;
+    } else {
+      candidates.unshift({ name, likely: true });
     }
   }
   return {
     ok: true,
     title,
-    candidates: candidates.slice(0, 20),
+    candidates: candidates.slice(0, 12),
     source: "instagram",
     source_detail: useEmbed ? "embed" : "og",
   };

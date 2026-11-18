@@ -770,7 +770,7 @@ $('addPlaceBtn').onclick = async () => {
    최근 링크는 이 브라우저의 localStorage에만 보관합니다.
    ============================================================ */
 const LINK_HISTORY_KEY = 'linkInboxHistory';
-let linkInbox = null; // { url, title, candidates: [이름...] }
+let linkInbox = null; // { url, title, candidates: [{ name, likely }] }
 
 function loadLinkHistory() {
   try { return JSON.parse(localStorage.getItem(LINK_HISTORY_KEY)) || []; }
@@ -820,12 +820,21 @@ function renderExtractResult() {
   }
   box.innerHTML = `
     <div class="day-head">「${esc(title)}」에서 찾은 후보</div>
-    ${candidates.map((name, i) => `
+    <div style="font-size:13px;margin:2px 0 6px">
+      <a href="#" id="candAll" style="margin-right:12px">전체 선택</a><a href="#" id="candNone">전체 해제</a>
+    </div>
+    ${candidates.map((c, i) => `
       <div class="checkline">
-        <input type="checkbox" id="cand-${i}" data-cand="${i}" checked>
-        <label for="cand-${i}" class="item-main" style="margin:0">${esc(name)}</label>
+        <input type="checkbox" id="cand-${i}" data-cand="${i}" ${c.likely ? 'checked' : ''}>
+        <label for="cand-${i}" class="item-main" style="margin:0">${esc(c.name)}</label>
       </div>`).join('')}
     <button id="addCandsBtn" class="btn-block" style="margin-top:10px">선택한 장소 보관함에 넣기</button>`;
+  const setAllCands = (checked) => (e) => {
+    e.preventDefault();
+    document.querySelectorAll('[data-cand]').forEach(c => { c.checked = checked; });
+  };
+  $('candAll').onclick = setAllCands(true);
+  $('candNone').onclick = setAllCands(false);
   $('addCandsBtn').onclick = addSelectedCandidates;
 }
 
@@ -836,7 +845,7 @@ async function addSelectedCandidates() {
   const memo = `출처: ${linkInbox.title} ${linkInbox.url}`;
   const rows = checked.map(c => ({
     trip_id: state.trip.id,
-    name: linkInbox.candidates[Number(c.dataset.cand)],
+    name: linkInbox.candidates[Number(c.dataset.cand)].name,
     category: $('linkCategory').value,
     memo,
     created_by: state.user.id,
@@ -872,7 +881,11 @@ $('extractBtn').onclick = async () => {
     linkInbox = {
       url,
       title: data.title || url,
-      candidates: (data.candidates || []).map(c => c.name).filter(Boolean),
+      // likely가 true인 후보만 기본 체크한다. 구버전 함수처럼
+      // likely가 없는 응답이면 전부 해제 상태로 표시한다.
+      candidates: (data.candidates || [])
+        .map(c => ({ name: c.name, likely: c.likely === true }))
+        .filter(c => c.name),
     };
     renderExtractResult();
     saveLinkHistoryItem({
