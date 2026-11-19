@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>여행·모임 정산 도구</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #6b7686;
@@ -150,6 +151,23 @@
     display: inline-block; font-size: 12px; font-weight: 700; color: #5b21b6;
     background: #ede9fe; border-radius: 999px; padding: 2px 8px; margin-top: 6px;
   }
+  /* 지도 (Leaflet) */
+  #tripMap {
+    height: 320px; border-radius: 10px; z-index: 0;
+    background: #eef2f7; font: inherit;
+  }
+  .map-pin-emoji {
+    font-size: 26px; line-height: 28px; text-align: center;
+    text-shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+  .map-pin-hotel {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: #e11d48; border: 2px solid #fff;
+    box-shadow: 0 1px 5px rgba(0,0,0,.4);
+    font-size: 16px; line-height: 28px; text-align: center;
+  }
+  .map-pop-title { font-weight: 800; font-size: 14px; }
+  .map-pop-sub { font-size: 12px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -271,6 +289,7 @@
       </div>
       <div class="total-box">예상 총예산: <span id="planTotal">0원</span></div>
       <div id="routeSection"></div>
+      <div id="mapSection"></div>
       <div id="planDays"></div>
       <div class="card">
         <h3>일정 추가</h3>
@@ -801,7 +820,7 @@ async function loadTripData() {
     const tb = b.start_at ? new Date(b.start_at).getTime() : Infinity;
     return ta - tb;
   });
-  renderBookings(); renderPlan(); renderRoute(); renderPlaces(); renderChecklist(); renderSettle(); renderShare();
+  renderBookings(); renderPlan(); renderRoute(); renderMap(); renderPlaces(); renderChecklist(); renderSettle(); renderShare();
 }
 
 function setTab(tab) {
@@ -810,6 +829,17 @@ function setTab(tab) {
     b.classList.toggle('active', b.dataset.tab === tab));
   ['plan', 'places', 'checklist', 'settle', 'share'].forEach(t =>
     $('tab-' + t).classList.toggle('hidden', t !== tab));
+  // 숨겨진 동안 크기가 0이었던 지도는 탭이 보일 때 크기를 다시 재야 한다.
+  if (tab === 'plan') {
+    requestAnimationFrame(() => {
+      if (mapState.map) {
+        mapState.map.invalidateSize();
+        fitMapBounds();
+      } else {
+        renderMap();
+      }
+    });
+  }
 }
 document.querySelectorAll('#tabBar button').forEach(b => {
   b.onclick = () => setTab(b.dataset.tab);
@@ -2452,6 +2482,163 @@ function brandRecHtml(p, rec) {
     </div>`;
   }
   return '';
+}
+
+/* ============================================================
+   지도 (일정 탭, 동선 추천 아래)
+   - 위치가 연결된 저장 장소를 전부 핀으로 보여 준다. 숙소 핀은
+     동선 추천과 같은 기준(geoHotelRef와 같은 선택 순서)으로
+     다른 색/아이콘으로 구분한다.
+   - 좌표는 DB에 WGS-84로 저장돼 있어 Leaflet + OSM 타일에 그대로 맞는다.
+   - Leaflet JS는 처음 지도가 필요할 때만 CDN에서 불러온다.
+   ============================================================ */
+const mapState = {
+  map: null,        // L.Map 인스턴스 (컨테이너를 다시 그리면 제거하고 재생성)
+  bounds: null,     // 마지막 핀 범위 (탭 전환 후 fitBounds 복원용)
+  leafletPromise: null,
+  renderSeq: 0,     // 겹치는 렌더 중 마지막 것만 반영하기 위한 순번
+};
+
+// 동선 추천의 기준 숙소와 같은 선택 순서로 숙소 원본을 찾는다.
+// 예약 숙소(좌표 연결된 것) 우선, 없으면 '숙소' 카테고리 장소.
+function mapHotelSource() {
+  const bk = (state.bookings || []).find(b =>
+    b.kind === '숙소' && b.lat != null && b.lng != null
+    && Number.isFinite(Number(b.lat)) && Number.isFinite(Number(b.lng)));
+  if (bk) return { kind: 'booking', obj: bk };
+  const h = state.places.find(p => p.category === '숙소' && placeHasLoc(p));
+  return h ? { kind: 'place', obj: h } : null;
+}
+
+// 지도에 찍을 핀 데이터를 만든다(순수 함수: 테스트 가능).
+// 위치 없는 장소는 제외하고, 일정 제목이 장소 이름과 정확히 같으면
+// 그 날짜(day_index)를 days에 모은다(동선 계산과 같은 연결 방식).
+function mapPinData() {
+  const hotel = mapHotelSource();
+  const daysByName = new Map();
+  for (const item of state.planItems || []) {
+    const t = String(item.title || '').trim();
+    if (!t) continue;
+    if (!daysByName.has(t)) daysByName.set(t, new Set());
+    daysByName.get(t).add(item.day_index);
+  }
+  const pins = [];
+  for (const p of state.places) {
+    if (!placeHasLoc(p)) continue;
+    const isHotel = !!(hotel && hotel.kind === 'place' && hotel.obj.id === p.id);
+    pins.push({
+      lat: Number(p.lat), lng: Number(p.lng),
+      name: p.name || '',
+      matchedName: p.matched_name || '',
+      address: p.address || '',
+      category: p.category || '기타',
+      isHotel,
+      days: [...(daysByName.get(String(p.name || '').trim()) || [])].sort((a, b) => a - b),
+    });
+  }
+  if (hotel && hotel.kind === 'booking') {
+    pins.unshift({
+      lat: Number(hotel.obj.lat), lng: Number(hotel.obj.lng),
+      name: hotel.obj.title || '숙소',
+      matchedName: '',
+      address: hotel.obj.address || '',
+      category: '숙소',
+      isHotel: true,
+      days: [],
+    });
+  }
+  return pins;
+}
+
+function mapPopupHtml(pin) {
+  let html = `<div class="map-pop-title">${esc(pin.name)}</div>`;
+  if (pin.matchedName && pin.matchedName !== pin.name) {
+    html += `<div class="map-pop-sub">${esc(pin.matchedName)}</div>`;
+  }
+  if (pin.address) html += `<div class="map-pop-sub">${esc(pin.address)}</div>`;
+  html += `<div style="margin-top:4px"><span class="chip">${esc(pin.category)}</span>`;
+  if (pin.isHotel) html += ' <span class="chip">🏨 숙소</span>';
+  html += '</div>';
+  if (pin.days && pin.days.length) {
+    html += `<div class="map-pop-sub" style="margin-top:4px">📅 ${pin.days.map(d => (d + 1) + '일차').join(' · ')} 일정에 있어요</div>`;
+  }
+  return html;
+}
+
+// Leaflet JS를 한 번만 불러온다.
+function loadLeaflet() {
+  if (window.L) return Promise.resolve(window.L);
+  if (mapState.leafletPromise) return mapState.leafletPromise;
+  mapState.leafletPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    s.onload = () => resolve(window.L);
+    s.onerror = () => { mapState.leafletPromise = null; reject(new Error('leaflet_load_failed')); };
+    document.head.appendChild(s);
+  });
+  return mapState.leafletPromise;
+}
+
+function fitMapBounds() {
+  if (!mapState.map || !mapState.bounds) return;
+  if (mapState.bounds.count === 1) {
+    mapState.map.setView(mapState.bounds.point, 15);
+  } else {
+    mapState.map.fitBounds(mapState.bounds.bounds, { padding: [24, 24] });
+  }
+}
+
+async function renderMap() {
+  const box = $('mapSection');
+  if (!box || !state.trip) return;
+  const seq = ++mapState.renderSeq;
+  // 컨테이너가 새로 그려지므로 기존 지도 인스턴스는 먼저 정리한다.
+  if (mapState.map) { mapState.map.remove(); mapState.map = null; mapState.bounds = null; }
+  const pins = mapPinData();
+  if (!pins.length) {
+    box.innerHTML = `<div class="card">
+      <h3>🗺 지도</h3>
+      <p class="muted">위치를 연결한 장소가 아직 없어요</p>
+    </div>`;
+    return;
+  }
+  box.innerHTML = `<div class="card">
+    <h3>🗺 지도</h3>
+    <div id="tripMap"></div>
+    <p class="muted" style="margin-top:8px">핀을 누르면 장소 정보를 볼 수 있어요. 지도는 위치 분포 확인용이고, 길찾기·검색은 각 장소의 "지도에서 보기"를 이용해 주세요.</p>
+  </div>`;
+  let L;
+  try {
+    L = await loadLeaflet();
+  } catch {
+    const el = $('tripMap');
+    if (el && seq === mapState.renderSeq) {
+      el.innerHTML = '<p class="muted" style="padding:12px">지도를 불러오지 못했어요. 네트워크를 확인해 주세요.</p>';
+    }
+    return;
+  }
+  // 그사이 더 새 렌더가 있었거나 컨테이너가 사라졌으면 중단한다.
+  if (seq !== mapState.renderSeq || !$('tripMap')) return;
+  const map = L.map('tripMap');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+  }).addTo(map);
+  const latlngs = [];
+  for (const pin of pins) {
+    const icon = pin.isHotel
+      ? L.divIcon({ className: '', html: '<div class="map-pin-hotel">🏨</div>', iconSize: [32, 32], iconAnchor: [16, 16] })
+      : L.divIcon({ className: '', html: '<div class="map-pin-emoji">📍</div>', iconSize: [28, 28], iconAnchor: [14, 26] });
+    L.marker([pin.lat, pin.lng], { icon }).addTo(map).bindPopup(mapPopupHtml(pin));
+    latlngs.push([pin.lat, pin.lng]);
+  }
+  mapState.map = map;
+  mapState.bounds = latlngs.length === 1
+    ? { count: 1, point: latlngs[0] }
+    : { count: latlngs.length, bounds: L.latLngBounds(latlngs) };
+  fitMapBounds();
+  // 숨겨진 탭 안에서 초기화됐으면 보이는 순간 크기가 어긋나므로 다시 잰다.
+  requestAnimationFrame(() => { if (mapState.map === map) map.invalidateSize(); });
 }
 
 /* ---------- 동선 추천 동작 ---------- */
