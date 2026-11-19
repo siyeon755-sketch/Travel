@@ -76,6 +76,13 @@
     display: inline-block; font-size: 12px; font-weight: 700; color: var(--brand-dark);
     background: #dbeafe; border-radius: 999px; padding: 2px 8px; margin-right: 6px;
   }
+  .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .filter-chips button {
+    background: #eef2f7; color: var(--text); padding: 7px 12px;
+    border-radius: 999px; font-size: 13px; font-weight: 600;
+  }
+  .filter-chips button:hover { background: #e2e8f0; }
+  .filter-chips button.active { background: var(--brand); color: #fff; }
   .warn {
     background: #fef3c7; border: 1px solid #fcd34d; color: #92400e;
     border-radius: 10px; padding: 12px; font-size: 13px; margin-bottom: 12px;
@@ -327,6 +334,11 @@
         <button id="bulkGeoBtn" class="btn-block secondary">전체 위치 찾기</button>
         <p id="bulkGeoMsg" class="muted"></p>
       </div>
+      <div class="card">
+        <h3>🔍 장소 찾기</h3>
+        <input type="text" id="plSearch" placeholder="이름이나 메모로 검색">
+        <div class="filter-chips" id="plCatChips"></div>
+      </div>
       <div id="placeList"></div>
     </div>
 
@@ -530,6 +542,7 @@ const state = {
   tab: 'plan',
   authMode: 'login',
   segCounter: 0,
+  placeFilter: { q: '', category: '전체' }, // 장소 보관함 검색·카테고리 필터 (탭 이동에도 유지)
 };
 
 // 날짜 유틸
@@ -1303,6 +1316,34 @@ async function updateBookingLocation(bkId, fields) {
 /* ============================================================
    장소 보관함 탭
    ============================================================ */
+const PLACE_CATEGORIES = ['음료', '식사', '디저트', '카페', '쇼핑', '관광', '명소', '숙소', '교통', '기타'];
+
+// 검색(장소 이름·메모 부분 일치)과 카테고리를 AND로 적용한다.
+function filterPlaces(places) {
+  const f = state.placeFilter;
+  const q = (f.q || '').trim().toLowerCase();
+  return places.filter(p => {
+    if (f.category && f.category !== '전체' && p.category !== f.category) return false;
+    if (q && !`${p.name || ''} ${p.memo || ''}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+function renderPlaceCatChips() {
+  const box = $('plCatChips');
+  if (!box) return;
+  box.innerHTML = ['전체', ...PLACE_CATEGORIES].map(c =>
+    `<button type="button" data-pl-cat="${esc(c)}" class="${state.placeFilter.category === c ? 'active' : ''}">${esc(c)}</button>`).join('');
+  box.querySelectorAll('[data-pl-cat]').forEach(b => {
+    b.onclick = () => {
+      state.placeFilter.category = b.dataset.plCat;
+      box.querySelectorAll('[data-pl-cat]').forEach(x =>
+        x.classList.toggle('active', x.dataset.plCat === state.placeFilter.category));
+      renderPlaces();
+    };
+  });
+}
+
 function renderPlaces() {
   renderLinkHistory();
   const box = $('placeList');
@@ -1310,10 +1351,15 @@ function renderPlaces() {
     box.innerHTML = '<div class="empty">아직 저장한 장소가 없습니다.<br>가고 싶은 장소를 위에 추가해 보세요.</div>';
     return;
   }
+  const visible = filterPlaces(state.places);
+  if (!visible.length) {
+    box.innerHTML = '<div class="empty">조건에 맞는 장소가 없어요.</div>';
+    return;
+  }
   const n = dayCount(state.trip);
   const dayOptions = Array.from({ length: n }, (_, i) =>
     `<option value="${i}">${i + 1}일차</option>`).join('');
-  box.innerHTML = state.places.map(p => `
+  box.innerHTML = visible.map(p => `
     <div class="card">
       <div class="item-line" style="border:0;padding:0">
         <div class="item-main">
@@ -1387,6 +1433,12 @@ function renderPlaces() {
     };
   });
 }
+
+renderPlaceCatChips();
+$('plSearch').addEventListener('input', (e) => {
+  state.placeFilter.q = e.target.value;
+  renderPlaces();
+});
 
 $('addPlaceBtn').onclick = async () => {
   const name = $('plName').value.trim();
