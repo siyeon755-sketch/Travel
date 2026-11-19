@@ -249,6 +249,7 @@
 
     <!-- 일정 탭 -->
     <div id="tab-plan">
+      <div id="bookingMsg" class="ok-msg" style="margin-bottom:8px"></div>
       <div id="bookingList"></div>
       <div class="card" id="bookingFormCard">
         <h3 id="bkFormTitle">예약 추가</h3>
@@ -284,6 +285,11 @@
         </div>
         <label for="bkMemo">메모</label>
         <input type="text" id="bkMemo" placeholder="메모 (선택)">
+        <div id="bkAmountWrap">
+          <label for="bkAmount">금액 (원)</label>
+          <input type="number" id="bkAmount" min="0" step="1" inputmode="numeric" placeholder="예: 350000 (선택)">
+        </div>
+        <div id="bkAmountNotice" class="muted hidden" style="margin:6px 0">금액 기능을 쓰려면 add-booking-amount.sql을 Supabase SQL Editor에서 한 번 실행해 주세요.</div>
         <button id="bkSaveBtn" class="btn-block">예약 저장</button>
         <button id="bkCancelBtn" class="btn-block secondary hidden">수정 취소</button>
       </div>
@@ -555,6 +561,7 @@ const state = {
   planItems: [],
   bookings: [],        // 예약 정보 (항공·기차·숙소·기타)
   bookingsReady: true, // bookings 테이블이 없으면 false
+  bookingAmountReady: true, // bookings.amount/expense_id 컬럼이 없으면 false
   places: [],
   checklist: [],
   expenses: [],        // segments + participant_ids 포함
@@ -815,6 +822,16 @@ async function loadTripData() {
   // 예약 정보는 테이블이 아직 없을 수 있어 따로 조회한다(실패해도 앱은 계속 동작).
   const bk = await sb.from('bookings').select('*').eq('trip_id', tid);
   state.bookingsReady = !bk.error;
+  // amount/expense_id 컬럼이 있는지 따로 확인한다. 없으면 금액 없이
+  // 기존 방식으로 동작하고, 금액 UI는 SQL 실행 안내로 대체된다.
+  if (state.bookingsReady) {
+    const probe = await sb.from('bookings')
+      .select('amount, expense_id').eq('trip_id', tid).limit(1);
+    state.bookingAmountReady = !probe.error;
+  } else {
+    state.bookingAmountReady = false;
+  }
+  $('bookingMsg').textContent = '';
   state.bookings = (bk.data || []).slice().sort((a, b) => {
     const ta = a.start_at ? new Date(a.start_at).getTime() : Infinity;
     const tb = b.start_at ? new Date(b.start_at).getTime() : Infinity;
@@ -920,6 +937,8 @@ $('addPlanBtn').onclick = async () => {
    항공·기차·숙소·기타 예약을 시작 시각 순으로 보여 준다.
    숙소 예약은 장소 위치 찾기와 같은 후보 검색으로 좌표를 연결할 수 있고,
    연결된 숙소 좌표는 장소 후보의 거리 기준점으로 우선 쓰인다.
+   예약에 금액(amount 컬럼)이 있으면 카드에서 정산 지출로 바로 추가할 수
+   있고, 만든 지출 id는 expense_id 컬럼에 기록해 중복 추가를 막는다.
    bookings 테이블이 없으면 안내만 표시하고 앱은 계속 동작한다.
    ============================================================ */
 const BK_WEEK = ['일', '월', '화', '수', '목', '금', '토'];
@@ -1034,8 +1053,64 @@ function bkGeoCandsHtml(b) {
   </div>`;
 }
 
+// 금액 입력칸/안내 표시를 컬럼 준비 상태에 맞춘다.
+function syncBkAmountUi() {
+  const ready = state.bookingsReady && state.bookingAmountReady;
+  $('bkAmountWrap').classList.toggle('hidden', !ready);
+  $('bkAmountNotice').classList.toggle('hidden', ready || !state.bookingsReady);
+}
+
+// 카드 아래 "정산에 지출로 추가" 영역. 금액이 없으면 아무것도 안 보여 준다.
+function bkExpenseHtml(b) {
+  if (!state.bookingAmountReady) return '';
+  if (!(Number(b.amount) > 0)) return '';
+  if (b.expense_id) {
+    return '<div style="margin-top:8px"><button class="secondary small" disabled>정산에 추가됨</button></div>';
+  }
+  return `<div style="margin-top:8px"><button class="secondary small" data-bk-expense="${b.id}">💸 정산에 지출로 추가</button></div>`;
+}
+
+// 예약 금액을 정산 지출 1건으로 만든다: 결제자는 내 멤버, 참여자는 전원,
+// 구간은 전액 1개. 만든 지출 id를 예약에 기록해 중복 추가를 막는다.
+async function addBookingToSettle(bkId) {
+  const b = state.bookings.find(x => x.id === bkId);
+  if (!b || b.expense_id) return;
+  const amount = Number(b.amount) || 0;
+  if (!amount) return;
+  if (!state.members.length) {
+    showError('정산 멤버가 없습니다. 정산 탭에서 멤버를 먼저 추가하세요.');
+    return;
+  }
+  const payer = state.members.find(m => m.linked_user_id === state.user.id);
+  if (!payer) {
+    showError('내 멤버 정보를 찾지 못했어요. 정산 탭의 멤버와 계정이 연결돼 있는지 확인해 주세요.');
+    return;
+  }
+  showError('');
+  const { data: exp, error } = await sb.from('expenses').insert({
+    trip_id: state.trip.id, title: b.title || '(제목 없음)',
+    payer_member_id: payer.id, total_amount: amount,
+    created_by: state.user.id,
+  }).select().single();
+  if (error) { showError('지출 저장 실패: ' + error.message); return; }
+  const { data: seg, error: segErr } = await sb.from('expense_segments')
+    .insert({ expense_id: exp.id, label: '', amount })
+    .select().single();
+  if (segErr) { showError('구간 저장 실패: ' + segErr.message); return; }
+  const { error: shErr } = await sb.from('segment_shares').insert(
+    state.members.map(m => ({ segment_id: seg.id, member_id: m.id })));
+  if (shErr) { showError('참여자 저장 실패: ' + shErr.message); return; }
+  const { error: bkErr } = await sb.from('bookings')
+    .update({ expense_id: exp.id }).eq('id', b.id);
+  if (bkErr) { showError('예약에 지출 연결 실패: ' + bkErr.message); return; }
+  await loadTripData();
+  $('bookingMsg').textContent =
+    `정산에 지출로 추가했어요: ${b.title || '(제목 없음)'} ${fmt(amount)}`;
+}
+
 function renderBookings() {
   const box = $('bookingList');
+  syncBkAmountUi();
   if (!state.bookingsReady) {
     box.innerHTML = '<div class="warn">예약 정보 준비가 아직 안 됐어요. bookings 테이블을 만드는 SQL을 먼저 실행해 주세요.</div>';
     $('bookingFormCard').classList.add('hidden');
@@ -1053,6 +1128,7 @@ function renderBookings() {
           <div class="item-title"><span class="chip">${esc(b.kind)}</span>${esc(b.title || '(제목 없음)')}</div>
           <div class="muted">${esc(bookingLine(b))}</div>
           ${b.memo ? `<div class="muted">${esc(b.memo)}</div>` : ''}
+          ${state.bookingAmountReady && Number(b.amount) > 0 ? `<div class="muted">금액: ${fmt(b.amount)}</div>` : ''}
         </div>
         <div style="display:flex;gap:6px;flex:0 0 auto">
           <button class="secondary small" data-bk-edit="${b.id}">수정</button>
@@ -1060,6 +1136,7 @@ function renderBookings() {
         </div>
       </div>
       ${b.kind === '숙소' ? bkLocHtml(b) : ''}
+      ${bkExpenseHtml(b)}
     </div>`).join('');
   box.querySelectorAll('[data-bk-edit]').forEach(btn => {
     btn.onclick = () => {
@@ -1074,6 +1151,9 @@ function renderBookings() {
       if (bkEditId === btn.dataset.bkDel) resetBkForm();
       await loadTripData();
     };
+  });
+  box.querySelectorAll('[data-bk-expense]').forEach(btn => {
+    btn.onclick = () => addBookingToSettle(btn.dataset.bkExpense);
   });
   box.querySelectorAll('[data-bk-geo-search]').forEach(btn => {
     btn.onclick = () => startBkGeoSearch(btn.dataset.bkGeoSearch);
@@ -1243,6 +1323,7 @@ function fillBkForm(b) {
   $('bkStart').value = toLocalInputValue(b.start_at);
   $('bkEnd').value = toLocalInputValue(b.end_at);
   $('bkMemo').value = b.memo || '';
+  $('bkAmount').value = b.amount != null ? b.amount : '';
   // 이미 좌표가 연결된 숙소면 폼에도 선택된 위치로 보여 준다.
   bkFormGeoState.status = '';
   bkFormGeoState.cands = null;
@@ -1262,7 +1343,7 @@ function resetBkForm() {
   setBkKind('항공');
   $('bkTitle').value = ''; $('bkFrom').value = ''; $('bkTo').value = '';
   $('bkAddress').value = ''; $('bkStart').value = ''; $('bkEnd').value = '';
-  $('bkMemo').value = '';
+  $('bkMemo').value = ''; $('bkAmount').value = '';
   $('bkFormTitle').textContent = '예약 추가';
   $('bkSaveBtn').textContent = '예약 저장';
   $('bkCancelBtn').classList.add('hidden');
@@ -1295,6 +1376,12 @@ $('bkSaveBtn').onclick = async () => {
     end_at: endV ? new Date(endV).toISOString() : null,
     memo: $('bkMemo').value.trim(),
   };
+  // 금액 컬럼이 준비됐을 때만 payload에 넣는다(없으면 저장이 깨진다).
+  // 빈 칸이나 0은 금액 없음(null)으로 저장한다.
+  if (state.bookingAmountReady) {
+    const amt = parseInt($('bkAmount').value, 10);
+    payload.amount = Number.isFinite(amt) && amt > 0 ? amt : null;
+  }
   if (kind === '숙소') {
     // 폼에서 후보를 골랐으면 좌표도 함께 저장한다. 고르지 않았으면(직접 입력)
     // 좌표는 비워 둔다 — 수정 중 선택을 취소한 경우도 연결이 풀린다.
