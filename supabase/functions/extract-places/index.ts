@@ -20,8 +20,10 @@
 //
 // 장소 검색 모드: POST { action: "find-places", queries: string[] } 로
 // 오면 링크 추출 대신 장소 이름으로 실제 위치를 검색해
-// { ok: true, candidates: [{ name, address, lat, lng, source }] } 를
-// 돌려준다. 중국 장소는 OpenStreetMap에 없는 경우가 많아(예: 상하이
+// { ok: true, candidates: [{ name, name_en?, address, lat, lng, source }] } 를
+// 돌려준다. name_en은 후보 이름의 영어 표기로, 후보를 돌려주기 전에
+// Gemini 배치 번역으로 한 번에 붙인다(번역 실패 시 name_en 없이
+// 기존과 동일하게 반환). 중국 장소는 OpenStreetMap에 없는 경우가 많아(예: 상하이
 // 데모레스 호텔은 중국명 黛茂诗酒店으로만 존재) Baidu 지도 공개 웹
 // 검색을 서버에서 호출한다. 이 경로는 아래 SSRF 허용 목록 검사를
 // 타지 않지만, 호출 대상이 코드에 고정된 map.baidu.com 주소 하나뿐
@@ -31,7 +33,8 @@
 // 오면 한글 이름만으로 중국 장소를 찾는다. Gemini가 현지(중국어)
 // 정식 이름·중국어 주소를 제안하고, 그 제안을 Baidu 검색으로 실측
 // 검증해 일치하는 POI만 { ok: true, resolved, candidates } 로
-// 돌려준다. 제안이 없거나 검증에 실패하면 후보를 만들지 않고
+// 돌려준다. candidates에도 find-places와 같은 name_en(영어 표기)이
+// 붙는다. 제안이 없거나 검증에 실패하면 후보를 만들지 않고
 // { ok: false, reason } 을 돌려준다 (지어낸 핀 금지).
 //
 // 인증: Verify JWT 기본값(켜짐) 유지 전제. 로그인한 사용자만
@@ -1437,6 +1440,9 @@ function baiduMcToWgs84(x: number, y: number): { lng: number; lat: number } {
 
 type FindPlaceCandidate = {
   name: string;
+  // 후보 이름의 영어 표기. addEnglishNames가 배치 번역으로 붙이며,
+  // 번역에 실패하면 필드 자체가 없다.
+  name_en?: string;
   address: string;
   lat: number;
   lng: number;
@@ -1500,6 +1506,211 @@ async function findPlaces(queries: string[]): Promise<FindPlaceCandidate[]> {
     }
   }
   return out;
+}
+
+// === 후보 영어 이름 (name_en): Gemini 배치 번역 ===
+// find-places·resolve-place 후보는 중국어 이름만으로 돌아와서,
+// 중국어를 못 읽는 사용자는 후보가 맞는지 판단할 수 없다. 그래서
+// 후보를 반환하기 전에 이름 목록 전체를 Gemini 한 번의 호출로
+// 번역해 name_en으로 붙인다(후보별 호출 금지).
+// 번역은 부가 정보일 뿐이라, 키가 없거나 호출이 실패하거나 응답
+// 형식이 깨지면 name_en 없이 기존 후보를 그대로 돌려준다 — 번역
+// 때문에 장소 검색 자체가 실패하면 안 된다.
+
+const NAME_EN_PROMPT_PREFIX =
+  `너는 중국 장소 이름을 영어로 번역하는 번역기다.
+아래 JSON 배열의 장소 이름(중국어)을 각각 영어로 번역해라.
+- 브랜드·체인 이름은 널리 쓰이는 공식 영어 표기를 써라 (예: 黛茂诗酒店 → Demores Hotel, 华夏银行 → Huaxia Bank).
+- 지점 괄호 안의 지명·역 이름도 번역해 괄호째 유지해라 (예: (上海豫园老西门地铁站店) → (Shanghai Yu Garden Laoximen Metro Station)).
+- 입력과 같은 순서·같은 개수의 영어 이름만 담은 JSON 배열 하나만 출력해라. 설명은 붙이지 마라.
+
+[장소 이름 목록]
+`;
+
+// 한자가 들어간 이름만 번역 대상이다. 이미 영어(라틴 문자) 위주인
+// 이름은 번역 없이 그 자체가 name_en이 된다.
+function nameNeedsTranslation(name: string): boolean {
+  return /[一-鿿]/.test(name);
+}
+
+// 번역 시도 결과. 실패 시 status로 원인을 구분하고, error에는
+// 짧은 원인(최대 200자)을 실어 함수 로그로만 남긴다(응답에는
+// 싣지 않는다 — 번역 실패는 조용히 name_en 없음으로 처리한다).
+type NameEnOutcome =
+  | { status: "ok"; names: string[] }
+  | { status: Exclude<AiStatus, "ok">; error?: string };
+
+// 1회 시도 결과. httpStatus는 재시도 여부 판단에만 쓴다.
+type NameEnAttemptOutcome = NameEnOutcome & { httpStatus?: number };
+
+// 이름 목록 번역 1회 시도. 타임아웃은 시도마다 새로 건다.
+async function attemptTranslateNames(
+  names: string[],
+  apiKey: string,
+): Promise<NameEnAttemptOutcome> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const res = await fetch(geminiEndpoint(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{ text: NAME_EN_PROMPT_PREFIX + JSON.stringify(names) }],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          // 번역 작업이라 깊은 추론이 필요 없어 LOW로 둔다.
+          thinkingConfig: { thinkingLevel: "LOW" },
+          maxOutputTokens: 2048,
+        },
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      // Gemini 오류 본문에서 핵심 메시지만 뽑아 원인으로 남긴다.
+      let detail = "";
+      try {
+        const errText = await res.text();
+        try {
+          const errJson = JSON.parse(errText);
+          detail = String(
+            errJson?.error?.message ?? errJson?.error?.status ?? "",
+          );
+        } catch {
+          detail = errText;
+        }
+      } catch {
+        // 오류 본문조차 못 읽으면 상태 코드만으로 충분하다
+      }
+      const aiError = scrubApiKey(
+        `HTTP ${res.status}${detail ? `: ${detail}` : ""}`,
+        apiKey,
+      ).slice(0, 200);
+      logAiFailure("error", aiError);
+      return { status: "error", error: aiError, httpStatus: res.status };
+    }
+    let data: {
+      candidates?: { content?: { parts?: { text?: unknown }[] } }[];
+    };
+    try {
+      data = await res.json();
+    } catch {
+      logAiFailure("bad_response", "response_not_json");
+      return { status: "bad_response", error: "response_not_json" };
+    }
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) {
+      logAiFailure("bad_response", "no_content_parts");
+      return { status: "bad_response", error: "no_content_parts" };
+    }
+    const textOut = parts
+      .map((p: { text?: unknown }) =>
+        typeof p?.text === "string" ? p.text : ""
+      )
+      .join("")
+      .trim();
+    if (!textOut) {
+      logAiFailure("bad_response", "empty_model_output");
+      return { status: "bad_response", error: "empty_model_output" };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(textOut);
+    } catch {
+      logAiFailure("bad_response", "model_output_not_json");
+      return { status: "bad_response", error: "model_output_not_json" };
+    }
+    // 입력과 같은 순서·같은 개수여야 대조가 안전하다. 하나라도
+    // 어긋나면 형식 깨짐으로 보고 전체를 버린다.
+    if (
+      !Array.isArray(parsed) || parsed.length !== names.length ||
+      parsed.some((v) => typeof v !== "string")
+    ) {
+      logAiFailure("bad_response", "translation_shape_mismatch");
+      return { status: "bad_response", error: "translation_shape_mismatch" };
+    }
+    const out = parsed.map((v) =>
+      (v as string).replace(/\s+/g, " ").trim()
+    );
+    return { status: "ok", names: out };
+  } catch (e) {
+    // 타임아웃(AbortController 중단)과 그 밖의 네트워크 오류를 구분한다.
+    const aborted = ctrl.signal.aborted ||
+      (e instanceof Error && e.name === "AbortError");
+    if (aborted) {
+      const aiError = `timeout_after_${GEMINI_TIMEOUT_MS}ms`;
+      logAiFailure("timeout", aiError);
+      return { status: "timeout", error: aiError };
+    }
+    const aiError = scrubApiKey(
+      e instanceof Error ? e.message : String(e),
+      apiKey,
+    ).slice(0, 200);
+    logAiFailure("error", aiError);
+    return { status: "error", error: aiError };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 이름 목록을 한 번의 호출로 번역한다. 일시 오류(503·429·
+// 타임아웃)면 기존 정책대로 1회 재시도한다. 끝내 실패하면
+// null을 돌려주고, 호출부는 name_en 없이 후보를 반환한다.
+async function translateNamesToEnglish(
+  names: string[],
+): Promise<string[] | null> {
+  const apiKey = geminiApiKey();
+  if (!apiKey) {
+    logAiFailure("no_key", "GEMINI_API_KEY not set");
+    return null;
+  }
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+    const outcome = await attemptTranslateNames(names, apiKey);
+    if (outcome.status === "ok") return outcome.names;
+    const retryable = outcome.status === "timeout" ||
+      outcome.httpStatus === 503 || outcome.httpStatus === 429;
+    if (!retryable || attempt >= GEMINI_MAX_ATTEMPTS) break;
+    await new Promise((resolve) =>
+      setTimeout(resolve, GEMINI_RETRY_DELAY_MS)
+    );
+  }
+  return null;
+}
+
+// 후보 배열에 name_en을 붙여 돌려준다. 같은 이름은 한 번만 번역
+// 목록에 넣는다. 번역이 필요 없는(이미 영어 위주인) 이름은 그
+// 자체가 name_en이 된다. 번역 호출이 실패하면 후보를 손대지
+// 않고 그대로 돌려준다(name_en 없음).
+async function addEnglishNames(
+  candidates: FindPlaceCandidate[],
+): Promise<FindPlaceCandidate[]> {
+  if (candidates.length === 0) return candidates;
+  const uniqueNames: string[] = [];
+  const seenNames = new Set<string>();
+  for (const c of candidates) {
+    if (!nameNeedsTranslation(c.name) || seenNames.has(c.name)) continue;
+    seenNames.add(c.name);
+    uniqueNames.push(c.name);
+  }
+  if (uniqueNames.length === 0) {
+    return candidates.map((c) => ({ ...c, name_en: c.name }));
+  }
+  const translated = await translateNamesToEnglish(uniqueNames);
+  if (!translated) return candidates;
+  const pairs: [string, string][] = uniqueNames.map((
+    n,
+    i,
+  ) => [n, translated[i] ?? ""]);
+  const byName = new Map(pairs);
+  return candidates.map((c) => {
+    if (!nameNeedsTranslation(c.name)) return { ...c, name_en: c.name };
+    const en = byName.get(c.name);
+    return en ? { ...c, name_en: en } : { ...c };
+  });
 }
 
 // === 이름 해석 (resolve-place): 한글 이름 → 현지 이름 제안 + 실측 검증 ===
@@ -1915,14 +2126,20 @@ async function suggestPlaceLocalName(
 // resolve-place 본체: Gemini 제안을 Baidu 실측으로 검증한다.
 // 도시명은 Baidu 쿼리에 쓸 수 있게 중국어 표기로 정규화해서
 // 코어에 넘긴다(Gemini 프롬프트에도 그대로 쓰인다).
+// 검증된 후보에는 find-places와 마찬가지로 영어 이름(name_en)을
+// 배치 번역으로 붙여 돌려준다(번역 실패 시 name_en 없이 반환).
 async function resolvePlace(name: string, city?: string) {
   const queryCity = baiduCityName(city);
-  return resolvePlaceCore(
+  const result = await resolvePlaceCore(
     name,
     queryCity,
     suggestPlaceLocalName,
     baiduPlaceSearch,
-  );
+  ) as { ok: boolean; candidates?: FindPlaceCandidate[] };
+  if (result.ok && Array.isArray(result.candidates)) {
+    result.candidates = await addEnglishNames(result.candidates);
+  }
+  return result;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -1969,7 +2186,10 @@ Deno.serve(async (req: Request) => {
         400,
       );
     }
-    const candidates = await findPlaces(queries);
+    const found = await findPlaces(queries);
+    // 돌려주기 전에 영어 이름(name_en)을 배치 번역으로 붙인다.
+    // 번역 실패 시에는 name_en 없이 기존과 동일하게 반환된다.
+    const candidates = await addEnglishNames(found);
     return jsonResponse({ ok: true, candidates });
   }
 
