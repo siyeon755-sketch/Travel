@@ -2578,6 +2578,8 @@ function brandRecHtml(p, rec) {
     const { cand, day, addedKm } = rec.best;
     return `<div style="margin-top:4px">
       <span class="ok-msg">추천 지점: ${esc(cand.name)}</span>
+      ${cand.nameKo ? `<div class="muted">${esc(cand.nameKo)}</div>` : ''}
+      ${cand.nameEn ? `<div class="muted">${esc(cand.nameEn)}</div>` : ''}
       ${cand.region ? `<div class="geo-region">${esc(cand.region)}</div>` : ''}
       <div class="muted oneline" title="${esc(cand.address)}">${esc(cand.address)}</div>
       <div class="muted">${day + 1}일차 동선에 넣으면 추가 이동 ${kmText(addedKm)}</div>
