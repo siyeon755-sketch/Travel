@@ -225,6 +225,7 @@
         </select>
         <label for="bkTitle" id="bkTitleLabel">편명</label>
         <input type="text" id="bkTitle" placeholder="예: KE887">
+        <button id="bkGeoFindBtn" class="secondary btn-block hidden" style="margin-top:8px">🔍 이름으로 찾기</button>
         <div id="bkFromWrap">
           <label for="bkFrom" id="bkFromLabel">출발 공항</label>
           <input type="text" id="bkFrom" placeholder="예: 인천">
@@ -237,6 +238,7 @@
           <label for="bkAddress">주소</label>
           <input type="text" id="bkAddress" placeholder="예: 상하이 황푸구 중화로 1465">
         </div>
+        <div id="bkFormGeo" class="hidden"></div>
         <div class="row">
           <div>
             <label for="bkStart" id="bkStartLabel">출발 일시</label>
@@ -878,6 +880,7 @@ const BK_LABELS = {
 };
 let bkEditId = null;
 const bkGeoState = { cands: {}, status: {} }; // bookingId -> 후보 배열 / 진행 상태
+const bkFormGeoState = { status: '', cands: null, picked: null }; // 예약 폼에서 찾은 후보 / 고른 위치 { lat, lng, address, name }
 
 // "1. 18. (월) 11:10" 형식. 사용자 로컬 시간 기준.
 function fmtBkDateTime(iso) {
@@ -1062,8 +1065,110 @@ function setBkKind(kind) {
   $('bkAddrWrap').classList.toggle('hidden', !isHotel);
   if (!isHotel) $('bkFromLabel').textContent = L.from;
   if (!isHotel && !isEtc) $('bkToLabel').textContent = L.to;
+  // 이름으로 위치 찾기는 숙소에서만 쓴다. 다른 유형으로 바꾸면 폼에서 고른 위치는 버린다.
+  if (!isHotel) {
+    bkFormGeoState.status = ''; bkFormGeoState.cands = null; bkFormGeoState.picked = null;
+  }
+  renderBkFormGeo();
 }
 $('bkKind').onchange = () => setBkKind($('bkKind').value);
+
+/* ---------- 예약 폼: 숙소 이름으로 찾기 ----------
+   저장 전에 폼 안에서 후보를 골라 이름·주소·좌표를 채운다.
+   후보 검색은 저장된 숙소 카드와 같은 경로(findBookingGeoCandidates)를 쓴다. */
+function renderBkFormGeo() {
+  const box = $('bkFormGeo');
+  if (!box) return;
+  const isHotel = $('bkKind').value === '숙소';
+  $('bkGeoFindBtn').classList.toggle('hidden', !isHotel);
+  box.classList.toggle('hidden', !isHotel);
+  if (!isHotel) { box.innerHTML = ''; return; }
+  let html = '';
+  if (bkFormGeoState.status === 'searching') {
+    html += '<p class="muted" style="margin-top:8px">위치를 찾는 중...</p>';
+  } else if (bkFormGeoState.cands) {
+    if (!bkFormGeoState.cands.length) {
+      html += '<p class="muted" style="margin-top:8px">후보를 찾지 못했어요. 이름이나 주소를 직접 입력해 주세요.</p>';
+    } else {
+      html += `<div style="margin-top:8px">
+        <div class="muted">맞는 위치를 골라 주세요.</div>
+        ${bkFormGeoState.cands.map((c, i) => `
+          <div class="geo-cand" data-bkform-geo-pick="${i}">
+            <div class="item-title">${esc(c.name)}</div>
+            ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
+            <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
+            ${c.distanceKm != null ? `<span class="geo-dist">숙소에서 약 ${c.distanceKm.toFixed(1)}km</span>` : ''}
+          </div>`).join('')}
+      </div>`;
+    }
+  }
+  if (bkFormGeoState.picked) {
+    const p = bkFormGeoState.picked;
+    html += `<div style="margin-top:8px">
+      <span class="ok-msg">📍 ${esc(p.address || p.name)}</span>
+      <div style="margin-top:6px">
+        <button class="secondary small" id="bkGeoUnpickBtn">선택 취소 (직접 입력으로 되돌리기)</button>
+      </div>
+    </div>`;
+  }
+  box.innerHTML = html;
+  box.querySelectorAll('[data-bkform-geo-pick]').forEach(el => {
+    el.onclick = () => pickBkFormGeo(Number(el.dataset.bkformGeoPick));
+  });
+  const unpick = $('bkGeoUnpickBtn');
+  if (unpick) {
+    unpick.onclick = () => {
+      bkFormGeoState.picked = null;
+      renderBkFormGeo();
+    };
+  }
+}
+
+// 후보를 고르면 이름·주소 칸을 채우고 좌표는 폼 상태에 보관한다(저장 시 함께 들어감).
+function pickBkFormGeo(idx) {
+  const cand = (bkFormGeoState.cands || [])[idx];
+  if (!cand) return;
+  bkFormGeoState.picked = {
+    lat: cand.lat, lng: cand.lng, address: cand.address, name: cand.name,
+  };
+  bkFormGeoState.cands = null;
+  bkFormGeoState.status = '';
+  $('bkTitle').value = cand.name;
+  $('bkAddress').value = cand.address;
+  renderBkFormGeo();
+}
+
+$('bkGeoFindBtn').onclick = async () => {
+  const name = $('bkTitle').value.trim();
+  if (!name) { showError('숙소 이름을 먼저 입력하세요.'); return; }
+  showError('');
+  bkFormGeoState.status = 'searching';
+  bkFormGeoState.cands = null;
+  renderBkFormGeo();
+  try {
+    bkFormGeoState.cands = await findBookingGeoCandidates({
+      title: name, lat: null, lng: null,
+      address: $('bkAddress').value.trim(),
+    });
+  } catch {
+    bkFormGeoState.cands = [];
+  }
+  bkFormGeoState.status = 'done';
+  renderBkFormGeo();
+};
+
+// 후보를 고른 뒤 이름·주소를 직접 고치면 좌표 연결은 풀린다(직접 입력으로 간주).
+function syncBkFormGeoPicked() {
+  const p = bkFormGeoState.picked;
+  if (!p) return;
+  if ($('bkTitle').value.trim() !== p.name
+    || $('bkAddress').value.trim() !== (p.address || '')) {
+    bkFormGeoState.picked = null;
+    renderBkFormGeo();
+  }
+}
+$('bkTitle').addEventListener('input', syncBkFormGeoPicked);
+$('bkAddress').addEventListener('input', syncBkFormGeoPicked);
 
 function fillBkForm(b) {
   bkEditId = b.id;
@@ -1076,6 +1181,13 @@ function fillBkForm(b) {
   $('bkStart').value = toLocalInputValue(b.start_at);
   $('bkEnd').value = toLocalInputValue(b.end_at);
   $('bkMemo').value = b.memo || '';
+  // 이미 좌표가 연결된 숙소면 폼에도 선택된 위치로 보여 준다.
+  bkFormGeoState.status = '';
+  bkFormGeoState.cands = null;
+  bkFormGeoState.picked = (b.kind === '숙소' && bkHasLoc(b))
+    ? { lat: Number(b.lat), lng: Number(b.lng), address: b.address || '', name: b.title || '' }
+    : null;
+  renderBkFormGeo();
   $('bkFormTitle').textContent = '예약 수정';
   $('bkSaveBtn').textContent = '수정 저장';
   $('bkCancelBtn').classList.remove('hidden');
@@ -1121,6 +1233,12 @@ $('bkSaveBtn').onclick = async () => {
     end_at: endV ? new Date(endV).toISOString() : null,
     memo: $('bkMemo').value.trim(),
   };
+  if (kind === '숙소') {
+    // 폼에서 후보를 골랐으면 좌표도 함께 저장한다. 고르지 않았으면(직접 입력)
+    // 좌표는 비워 둔다 — 수정 중 선택을 취소한 경우도 연결이 풀린다.
+    payload.lat = bkFormGeoState.picked ? bkFormGeoState.picked.lat : null;
+    payload.lng = bkFormGeoState.picked ? bkFormGeoState.picked.lng : null;
+  }
   let error;
   if (bkEditId) {
     // 숙소가 아닌 유형으로 바꾸면 예전 숙소 좌표는 남기지 않는다.
