@@ -542,7 +542,12 @@ $('authSubmit').onclick = async () => {
       }
     } else {
       const { error } = await sb.auth.signInWithPassword({ email, password });
-      if (error) throw error;
+      if (error) {
+        if (/not confirmed/i.test(error.message || '')) {
+          $('resendBtn').classList.remove('hidden');
+        }
+        throw error;
+      }
     }
   } catch (e) {
     showError('인증 실패: ' + e.message);
