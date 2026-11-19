@@ -135,6 +135,14 @@
     display: inline-block; font-size: 12px; font-weight: 700; color: var(--brand-dark);
     background: #dcfce7; border-radius: 999px; padding: 2px 8px; margin-top: 6px;
   }
+  .geo-match {
+    display: inline-block; font-size: 12px; font-weight: 700; color: #92400e;
+    background: #fef3c7; border-radius: 999px; padding: 2px 8px; margin-top: 6px;
+  }
+  .geo-ai {
+    display: inline-block; font-size: 12px; font-weight: 700; color: #5b21b6;
+    background: #ede9fe; border-radius: 999px; padding: 2px 8px; margin-top: 6px;
+  }
 </style>
 </head>
 <body>
@@ -969,12 +977,15 @@ function bkGeoCandsHtml(b) {
   }
   return `<div style="margin-top:8px">
     <div class="muted">맞는 위치를 골라 주세요.</div>
+    ${aiFoundNoticeHtml(cands)}
     ${cands.map((c, i) => `
       <div class="geo-cand" data-bk-geo-pick="${b.id}:${i}">
         <div class="item-title">${esc(c.name)}</div>
         ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
         <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
         ${c.distanceKm != null ? `<span class="geo-dist">숙소에서 약 ${c.distanceKm.toFixed(1)}km</span>` : ''}
+        ${c.addrMatch ? '<span class="geo-match">주소 일치</span>' : ''}
+        ${c.aiMatch ? '<span class="geo-ai">AI로 찾음</span>' : ''}
       </div>`).join('')}
   </div>`;
 }
@@ -1092,12 +1103,15 @@ function renderBkFormGeo() {
     } else {
       html += `<div style="margin-top:8px">
         <div class="muted">맞는 위치를 골라 주세요.</div>
+        ${aiFoundNoticeHtml(bkFormGeoState.cands)}
         ${bkFormGeoState.cands.map((c, i) => `
           <div class="geo-cand" data-bkform-geo-pick="${i}">
             <div class="item-title">${esc(c.name)}</div>
             ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
             <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
             ${c.distanceKm != null ? `<span class="geo-dist">숙소에서 약 ${c.distanceKm.toFixed(1)}km</span>` : ''}
+            ${c.addrMatch ? '<span class="geo-match">주소 일치</span>' : ''}
+            ${c.aiMatch ? '<span class="geo-ai">AI로 찾음</span>' : ''}
           </div>`).join('')}
       </div>`;
     }
@@ -1124,17 +1138,20 @@ function renderBkFormGeo() {
   }
 }
 
-// 후보를 고르면 이름·주소 칸을 채우고 좌표는 폼 상태에 보관한다(저장 시 함께 들어감).
+// 후보를 고르면 주소 칸을 채우고 좌표는 폼 상태에 보관한다(저장 시 함께 들어감).
+// 이름 칸은 비어 있을 때만 후보 이름으로 채우고, 사용자가 입력한 이름
+// (예: "데모레스 호텔")은 후보 상호(黛茂诗酒店)로 덮어쓰지 않는다.
 function pickBkFormGeo(idx) {
   const cand = (bkFormGeoState.cands || [])[idx];
   if (!cand) return;
+  if (!$('bkTitle').value.trim()) $('bkTitle').value = cand.name;
+  $('bkAddress').value = cand.address;
   bkFormGeoState.picked = {
-    lat: cand.lat, lng: cand.lng, address: cand.address, name: cand.name,
+    lat: cand.lat, lng: cand.lng, address: cand.address,
+    name: $('bkTitle').value.trim(),
   };
   bkFormGeoState.cands = null;
   bkFormGeoState.status = '';
-  $('bkTitle').value = cand.name;
-  $('bkAddress').value = cand.address;
   renderBkFormGeo();
 }
 
@@ -1445,12 +1462,15 @@ function geoCandsHtml(p) {
   }
   return `<div style="margin-top:8px">
     <div class="muted">맞는 위치를 골라 주세요.</div>
+    ${aiFoundNoticeHtml(cands)}
     ${cands.map((c, i) => `
       <div class="geo-cand" data-geo-pick="${p.id}:${i}">
         <div class="item-title">${esc(c.name)}</div>
         ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
         <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
         ${c.distanceKm != null ? `<span class="geo-dist">숙소에서 약 ${c.distanceKm.toFixed(1)}km</span>` : ''}
+        ${c.addrMatch ? '<span class="geo-match">주소 일치</span>' : ''}
+        ${c.aiMatch ? '<span class="geo-ai">AI로 찾음</span>' : ''}
       </div>`).join('')}
   </div>`;
 }
@@ -1548,20 +1568,20 @@ function geoHotelRef() {
    원저우 지점이 섞임), 여행 목적지에서 도시를 추정할 수 있으면 그 도시
    표기가 주소에 없는 후보는 제외한다. 도시 추정이 안 되면 필터를 건너뛴다. */
 const GEO_CITY_TABLE = [
-  { keys: ['상하이', '상해', '上海', 'shanghai'], tokens: ['上海', '上海市', '상하이', '상해', 'shanghai'] },
-  { keys: ['베이징', '北京', 'beijing'], tokens: ['北京', '北京市', '베이징', 'beijing'] },
-  { keys: ['청두', '成都', 'chengdu'], tokens: ['成都', '成都市', '청두', 'chengdu'] },
-  { keys: ['충칭', '重庆', '重慶', 'chongqing'], tokens: ['重庆', '重慶', '충칭', 'chongqing'] },
-  { keys: ['시안', '西安', "xi'an", 'xian'], tokens: ['西安', '시안', "xi'an"] },
-  { keys: ['광저우', '广州', '廣州', 'guangzhou'], tokens: ['广州', '廣州', '광저우', 'guangzhou'] },
-  { keys: ['선전', '深圳', 'shenzhen'], tokens: ['深圳', '선전', 'shenzhen'] },
-  { keys: ['항저우', '杭州', 'hangzhou'], tokens: ['杭州', '항저우', 'hangzhou'] },
-  { keys: ['난징', '南京', 'nanjing'], tokens: ['南京', '난징', 'nanjing'] },
-  { keys: ['쑤저우', '苏州', '蘇州', 'suzhou'], tokens: ['苏州', '蘇州', '쑤저우', 'suzhou'] },
-  { keys: ['우한', '武汉', '武漢', 'wuhan'], tokens: ['武汉', '武漢', '우한', 'wuhan'] },
-  { keys: ['샤먼', '厦门', '廈門', 'xiamen'], tokens: ['厦门', '廈門', '샤먼', 'xiamen'] },
-  { keys: ['홍콩', '香港', 'hong kong'], tokens: ['香港', '홍콩', 'hong kong'] },
-  { keys: ['마카오', '澳门', '澳門', 'macau', 'macao'], tokens: ['澳门', '澳門', '마카오', 'macau', 'macao'] },
+  { china: true, keys: ['상하이', '상해', '上海', 'shanghai'], tokens: ['上海', '上海市', '상하이', '상해', 'shanghai'] },
+  { china: true, keys: ['베이징', '北京', 'beijing'], tokens: ['北京', '北京市', '베이징', 'beijing'] },
+  { china: true, keys: ['청두', '成都', 'chengdu'], tokens: ['成都', '成都市', '청두', 'chengdu'] },
+  { china: true, keys: ['충칭', '重庆', '重慶', 'chongqing'], tokens: ['重庆', '重慶', '충칭', 'chongqing'] },
+  { china: true, keys: ['시안', '西安', "xi'an", 'xian'], tokens: ['西安', '시안', "xi'an"] },
+  { china: true, keys: ['광저우', '广州', '廣州', 'guangzhou'], tokens: ['广州', '廣州', '광저우', 'guangzhou'] },
+  { china: true, keys: ['선전', '深圳', 'shenzhen'], tokens: ['深圳', '선전', 'shenzhen'] },
+  { china: true, keys: ['항저우', '杭州', 'hangzhou'], tokens: ['杭州', '항저우', 'hangzhou'] },
+  { china: true, keys: ['난징', '南京', 'nanjing'], tokens: ['南京', '난징', 'nanjing'] },
+  { china: true, keys: ['쑤저우', '苏州', '蘇州', 'suzhou'], tokens: ['苏州', '蘇州', '쑤저우', 'suzhou'] },
+  { china: true, keys: ['우한', '武汉', '武漢', 'wuhan'], tokens: ['武汉', '武漢', '우한', 'wuhan'] },
+  { china: true, keys: ['샤먼', '厦门', '廈門', 'xiamen'], tokens: ['厦门', '廈門', '샤먼', 'xiamen'] },
+  { china: true, keys: ['홍콩', '香港', 'hong kong'], tokens: ['香港', '홍콩', 'hong kong'] },
+  { china: true, keys: ['마카오', '澳门', '澳門', 'macau', 'macao'], tokens: ['澳门', '澳門', '마카오', 'macau', 'macao'] },
   { keys: ['타이베이', '台北', 'taipei'], tokens: ['台北', '타이베이', 'taipei'] },
   { keys: ['서울', 'seoul'], tokens: ['서울', 'seoul'] },
   { keys: ['부산', 'busan'], tokens: ['부산', 'busan'] },
@@ -1661,6 +1681,191 @@ function geoSortCands(list, hotel) {
   return list.slice(0, 6);
 }
 
+/* ---------- Baidu 후보 (중국 여행 전용) ----------
+   중국 장소는 Nominatim에 없는 경우가 많아(예: 데모레스 호텔), 중국 도시
+   여행일 때만 Edge Function(extract-places, action 'find-places')으로
+   Baidu 후보를 받아 같은 게이트 파이프라인에 합친다. 함수가 없거나
+   실패하면 조용히 Nominatim 결과만으로 진행한다. */
+// 현재 여행이 중국 도시인지 (GEO_CITY_TABLE의 china 표식 기준).
+function geoTripIsChina() {
+  const city = geoTripCity();
+  return !!(city && city.china);
+}
+
+// Baidu 후보 { name, address, lat, lng }를 Nominatim 결과 형태로 맞춘다.
+// 주소는 문자열이라 구조화 주소(address 객체)에는 넣지 않고 display_name으로만 쓴다.
+function baiduHitAdapter(c) {
+  if (!c) return null;
+  const lat = Number(c.lat);
+  const lng = Number(c.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const name = String(c.name || '').trim();
+  if (!name) return null;
+  return {
+    lat, lon: lng,
+    name,
+    display_name: String(c.address || name).trim(),
+    address: null,
+  };
+}
+
+// Edge Function에서 Baidu 후보를 한 번만 받아 어댑터까지 마친 배열로 돌려준다.
+async function fetchBaiduCandidates(queries) {
+  const qs = [...new Set((queries || []).map(q => String(q || '').trim()).filter(Boolean))].slice(0, 6);
+  if (!qs.length) return [];
+  try {
+    const { data, error } = await sb.functions.invoke('extract-places', {
+      body: { action: 'find-places', queries: qs },
+    });
+    if (error || !data || data.ok !== true || !Array.isArray(data.candidates)) return [];
+    const out = [];
+    for (const c of data.candidates) {
+      const h = baiduHitAdapter(c);
+      if (h) out.push(h);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/* ---------- 주소로 찾기 폴백 (단일 검색 전용) ----------
+   이름이 음차만 다른 경우(예: "데모레스 호텔"의 실제 상호 黛茂诗酒店)는
+   이름 게이트 점수가 0이라 이름 기반 후보가 하나도 안 남는다. 하지만 주소가
+   정확히 일치하면 이름보다 강한 동일성 근거이므로, 이름 후보가 없을 때
+   주소로 한 번 더 찾고 주소가 맞는 후보만 이름 게이트를 우회해 통과시킨다.
+   도시 필터와 숙소에서 거리 필터는 그대로 적용한다. */
+// 주소 쿼리에서 핵심 토큰을 뽑는다: 도로명+번지("中华路1465"), 번지+号("1465号").
+// 도로 패턴이 없으면(한글 주소 등) 3자리 이상 숫자만 마지막 수단으로 쓴다.
+function geoAddrCoreTokens(addr) {
+  const norm = String(addr || '').replace(/[\s,，、·]/g, '');
+  if (!norm) return [];
+  const tokens = new Set();
+  const roadRe = /([\p{Script=Han}]{0,6}?(?:公路|大道|路|街|道|巷|弄))(\d+)号?/gu;
+  let m;
+  while ((m = roadRe.exec(norm))) {
+    // 시·구 접두가 붙어 뽑힌 경우 도로명(접미 앞 최대 4자)만 남긴다.
+    const suf = m[1].match(/(公路|大道|路|街|道|巷|弄)$/)[1];
+    const stem = m[1].slice(0, m[1].length - suf.length);
+    const road = stem.slice(-4) + suf;
+    tokens.add(road + m[2]);
+    tokens.add(road + m[2] + '号');
+    tokens.add(m[2] + '号');
+  }
+  if (!tokens.size) {
+    for (const num of norm.match(/\d{3,}/g) || []) tokens.add(num);
+  }
+  return [...tokens];
+}
+
+// 주소 폴백 전용 게이트: 이름 점수는 보지 않고, 후보 주소에 핵심 토큰이
+// 포함될 때만 통과시킨다. 점수는 중간값(0.6)을 줘서 이름 일치 후보보다
+// 앞에 서지 않게 한다.
+function geoAddAddrHit(byKey, h, tokens, ctx) {
+  const lat = Number(h.lat);
+  const lng = Number(h.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+  if (byKey.has(key)) return;
+  const candName = String(h.name || (h.display_name || '').split(',')[0] || '').trim();
+  if (!candName) return;
+  const candAddr = String(h.display_name || '').replace(/[\s,，、·]/g, '');
+  if (!tokens.some(t => candAddr.includes(t))) return; // 주소 핵심 부분이 다르면 탈락
+  if (!geoCandInCity(h, ctx.city)) return; // 다른 도시 후보는 제외한다.
+  const distKm = ctx.hotel ? haversineKm(ctx.hotel.lat, ctx.hotel.lng, lat, lng) : null;
+  if (distKm != null && distKm > 60) return; // 숙소에서 너무 먼 후보는 제외한다.
+  byKey.set(key, {
+    name: candName,
+    address: h.display_name || '',
+    region: geoRegionLabel(h),
+    lat, lng, score: 0.6,
+    addrMatch: true,
+    distanceKm: ctx.selfIsHotel ? null : distKm,
+    sortDistKm: distKm,
+  });
+}
+
+// 주소 텍스트로 Edge Function(Baidu)을 별도 호출해 주소 일치 후보만 돌려준다.
+// 중국 여행이 아니면 Baidu 경로 자체를 쓰지 않는다(기존 파이프라인과 동일).
+async function findGeoByAddressFallback(refPlace, addressText) {
+  const addr = String(addressText || '').trim();
+  if (!addr || !geoTripIsChina()) return [];
+  const tokens = geoAddrCoreTokens(addr);
+  if (!tokens.length) return [];
+  const ctx = geoHitCtx(refPlace);
+  const byKey = new Map();
+  const hits = await fetchBaiduCandidates([addr]);
+  for (const h of hits) geoAddAddrHit(byKey, h, tokens, ctx);
+  return geoSortCands([...byKey.values()], ctx.hotel);
+}
+
+/* ---------- 한글 이름으로 찾기 (AI 해석, 단일 검색의 마지막 단계) ----------
+   한글 이름만으로는 중국 상호를 어떤 지도에서도 찾을 수 없다(예: "데모레스
+   호텔" → 黛茂诗酒店). 이름·주소 기반 후보가 모두 없을 때만 Edge Function의
+   resolve-place 액션을 호출한다: 서버가 AI로 중국 이름을 해석하고 Baidu
+   POI로 검증까지 마친 후보만 돌려준다. 클라이언트에서는 서버 검증을 신뢰해
+   이름 게이트를 우회하되, 도시 필터와 숙소에서 60km 거리 필터는 그대로
+   적용한다. 전체 위치 찾기(벌크)에서는 호출하지 않는다. */
+// AI 검증 후보 전용 게이트: 이름 점수는 보지 않고 도시·거리만 본다.
+function geoAddAiHit(byKey, h, ctx, localName) {
+  const lat = Number(h.lat);
+  const lng = Number(h.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+  if (byKey.has(key)) return;
+  const candName = String(h.name || (h.display_name || '').split(',')[0] || '').trim();
+  if (!candName) return;
+  if (!geoCandInCity(h, ctx.city)) return; // 다른 도시 후보는 제외한다.
+  const distKm = ctx.hotel ? haversineKm(ctx.hotel.lat, ctx.hotel.lng, lat, lng) : null;
+  if (distKm != null && distKm > 60) return; // 숙소에서 너무 먼 후보는 제외한다.
+  byKey.set(key, {
+    name: candName,
+    address: h.display_name || '',
+    region: geoRegionLabel(h),
+    lat, lng, score: 0.7,
+    aiMatch: true,
+    aiLocalName: localName || '',
+    distanceKm: ctx.selfIsHotel ? null : distKm,
+    sortDistKm: distKm,
+  });
+}
+
+// 후보 목록 위에 붙일 "중국 이름 …으로 찾았어요" 안내. AI 후보가 있을 때만.
+function aiFoundNoticeHtml(cands) {
+  const ai = (cands || []).find(c => c.aiLocalName);
+  return ai ? `<div class="muted">중국 이름 ${esc(ai.aiLocalName)}으로 찾았어요.</div>` : '';
+}
+
+// 한글 이름 → resolve-place 호출. 중국 여행이고 이름에 한글이 있을 때만 동작.
+async function findGeoByResolveFallback(refPlace, rawName) {
+  const name = String(rawName || '').trim();
+  if (!name || !geoTripIsChina()) return [];
+  if (!/\p{Script=Hangul}/u.test(name)) return [];
+  const cityEntry = geoTripCity();
+  const cityName = cityEntry
+    ? (cityEntry.keys.find(k => /\p{Script=Hangul}/u.test(k)) || cityEntry.keys[0] || '')
+    : '';
+  let data;
+  try {
+    const res = await sb.functions.invoke('extract-places', {
+      body: { action: 'resolve-place', name, city: cityName },
+    });
+    if (res.error) return [];
+    data = res.data;
+  } catch {
+    return [];
+  }
+  if (!data || data.ok !== true || !Array.isArray(data.candidates)) return [];
+  const localName = String((data.resolved && data.resolved.local_name) || '').trim();
+  const ctx = geoHitCtx(refPlace);
+  const byKey = new Map();
+  for (const c of data.candidates) {
+    const h = baiduHitAdapter(c);
+    if (h) geoAddAiHit(byKey, h, ctx, localName);
+  }
+  return geoSortCands([...byKey.values()], ctx.hotel);
+}
+
 async function findGeoCandidates(place, maxQueries = 4) {
   const variants = geoNameVariants(place);
   if (!variants.length) return [];
@@ -1679,6 +1884,14 @@ async function findGeoCandidates(place, maxQueries = 4) {
     for (const h of hits) geoAddHit(byKey, h, variants, ctx);
     if (byKey.size >= 6) break;
   }
+  // 중국 여행이면 Baidu 후보도 같은 게이트·필터·정렬에 합친다 (장소당 1회 호출).
+  if (geoTripIsChina()) {
+    const bq = [...qs];
+    const addr = String(place.address || '').trim();
+    if (addr) bq.push(addr);
+    const bHits = await fetchBaiduCandidates(bq);
+    for (const h of bHits) geoAddHit(byKey, h, variants, ctx);
+  }
   return geoSortCands([...byKey.values()], ctx.hotel);
 }
 
@@ -1686,22 +1899,33 @@ async function findGeoCandidates(place, maxQueries = 4) {
 // 저장 대상만 bookings로 다르다. 이름으로 못 찾으면 주소로도 검색해 본다
 // (게이트 판정은 숙소 이름 기준).
 async function findBookingGeoCandidates(bk) {
-  const ref = { name: bk.title, lat: bk.lat, lng: bk.lng };
+  // address도 실어 두면 중국 여행일 때 Baidu 쿼리에 함께 들어간다.
+  const ref = { name: bk.title, lat: bk.lat, lng: bk.lng, address: bk.address || '' };
   const cands = await findGeoCandidates(ref, 4);
-  if (cands.length || !bk.address) return cands;
-  const variants = geoNameVariants(ref);
-  if (!variants.length) return cands;
-  const ctx = geoHitCtx(ref);
-  const byKey = new Map();
-  const dest = (state.trip?.destination || '').trim();
-  const qs = dest ? [`${bk.address}, ${dest}`, bk.address] : [bk.address];
-  for (const q of qs) {
-    let hits = [];
-    try { hits = await nominatimSearch(q); } catch { hits = []; }
-    for (const h of hits) geoAddHit(byKey, h, variants, ctx);
-    if (byKey.size) break;
+  if (cands.length) return cands;
+  if (bk.address) {
+    const variants = geoNameVariants(ref);
+    if (variants.length) {
+      const ctx = geoHitCtx(ref);
+      const byKey = new Map();
+      const dest = (state.trip?.destination || '').trim();
+      const qs = dest ? [`${bk.address}, ${dest}`, bk.address] : [bk.address];
+      for (const q of qs) {
+        let hits = [];
+        try { hits = await nominatimSearch(q); } catch { hits = []; }
+        for (const h of hits) geoAddHit(byKey, h, variants, ctx);
+        if (byKey.size) break;
+      }
+      const addrCands = geoSortCands([...byKey.values()], ctx.hotel);
+      if (addrCands.length) return addrCands;
+    }
+    // 이름 게이트로는 끝내 못 찾으면 주소 일치로 판정하는 폴백을 쓴다
+    // (예: "데모레스 호텔" + 中华路1465号 → 黛茂诗酒店).
+    const addrFb = await findGeoByAddressFallback(ref, bk.address);
+    if (addrFb.length) return addrFb;
   }
-  return geoSortCands([...byKey.values()], ctx.hotel);
+  // 그래도 없으면 마지막 단계: 한글 이름을 AI로 해석해 찾는 폴백.
+  return findGeoByResolveFallback(ref, bk.title);
 }
 
 async function startGeoSearch(placeId) {
@@ -1711,6 +1935,14 @@ async function startGeoSearch(placeId) {
   renderPlaces();
   try {
     geoState.cands[placeId] = await findGeoCandidates(place, 4);
+    // 이름 후보가 없고 주소 텍스트가 있으면 주소 일치 폴백도 시도한다.
+    if (!geoState.cands[placeId].length && place.address) {
+      geoState.cands[placeId] = await findGeoByAddressFallback(place, place.address);
+    }
+    // 그래도 없으면 마지막 단계: 한글 이름을 AI로 해석해 찾는 폴백.
+    if (!geoState.cands[placeId].length) {
+      geoState.cands[placeId] = await findGeoByResolveFallback(place, place.name);
+    }
   } catch {
     geoState.cands[placeId] = [];
   }

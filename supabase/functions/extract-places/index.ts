@@ -18,6 +18,22 @@
 //       { ok: false, reason }
 //   likely=true인 후보만 화면에서 기본 체크된다.
 //
+// 장소 검색 모드: POST { action: "find-places", queries: string[] } 로
+// 오면 링크 추출 대신 장소 이름으로 실제 위치를 검색해
+// { ok: true, candidates: [{ name, address, lat, lng, source }] } 를
+// 돌려준다. 중국 장소는 OpenStreetMap에 없는 경우가 많아(예: 상하이
+// 데모레스 호텔은 중국명 黛茂诗酒店으로만 존재) Baidu 지도 공개 웹
+// 검색을 서버에서 호출한다. 이 경로는 아래 SSRF 허용 목록 검사를
+// 타지 않지만, 호출 대상이 코드에 고정된 map.baidu.com 주소 하나뿐
+// 이라 임의 URL fetch가 아니다 (findPlaces 주석 참고).
+//
+// 이름 해석 모드: POST { action: "resolve-place", name, city? } 로
+// 오면 한글 이름만으로 중국 장소를 찾는다. Gemini가 현지(중국어)
+// 정식 이름·중국어 주소를 제안하고, 그 제안을 Baidu 검색으로 실측
+// 검증해 일치하는 POI만 { ok: true, resolved, candidates } 로
+// 돌려준다. 제안이 없거나 검증에 실패하면 후보를 만들지 않고
+// { ok: false, reason } 을 돌려준다 (지어낸 핀 금지).
+//
 // 인증: Verify JWT 기본값(켜짐) 유지 전제. 로그인한 사용자만
 // 호출할 수 있고, 이 함수 안에서 별도 JWT 검사는 하지 않습니다.
 //
@@ -1315,6 +1331,590 @@ async function extractGeneric(url: URL): Promise<ExtractResult> {
   };
 }
 
+// === 장소 검색 (find-places): Baidu 지도 공개 웹 검색 ===
+// 중국 장소는 OpenStreetMap(Nominatim) 커버리지가 얇아 없는 경우가
+// 많고, 고덕지도(Amap)는 개발자 키 없이는 서버에서 조회할 수 없어,
+// 프로토타입에서 검증된 Baidu 공개 웹 검색(map.baidu.com/?qt=s)을
+// 쓴다. Baidu는 좌표를 자체 메르카토르 격자(BD-09MC)로 돌려주므로
+// BD-09MC → BD-09 → GCJ-02 → WGS-84 로 변환해 저장 좌표 체계
+// (WGS-84)로 맞춘다. 변환 상수·공식은 gcoord 라이브러리(MIT)를
+// 따르고, 상하이 랜드마크 기준으로 실측과 대조 검증돼 있다.
+//
+// SSRF 관련: 이 검색이 호출하는 주소는 코드에 고정된
+// https://map.baidu.com/ 하나뿐이고, 사용자 입력(검색어)은 wd 쿼리
+// 파라미터로만 들어간다. 사용자가 준 URL을 가져오는 것이 아니므로
+// 링크 추출 경로의 ALLOWED_HOSTS 검사는 적용하지 않는다.
+
+const MC_BAND = [12890594.86, 8362377.87, 5591021, 3481989.83, 1678043.12, 0];
+const MC_TO_LL: number[][] = [
+  [1.410526172116255e-8, 0.00000898305509648872, -1.9939833816331, 200.9824383106796, -187.2403703815547, 91.6087516669843, -23.38765649603339, 2.57121317296198, -0.03801003308653, 17337981.2],
+  [-7.435856389565537e-9, 0.000008983055097726239, -0.78625201886289, 96.32687599759846, -1.85204757529826, -59.36935905485877, 47.40033549296737, -16.50741931063887, 2.28786674699375, 10260144.86],
+  [-3.030883460898826e-8, 0.00000898305509983578, 0.30071316287616, 59.74293618442277, 7.357984074871, -25.38371002664745, 13.45380521110908, -3.29883767235584, 0.32710905363475, 6856817.37],
+  [-1.981981304930552e-8, 0.000008983055099779535, 0.03278182852591, 40.31678527705744, 0.65659298677277, -4.44255534477492, 0.85341911805263, 0.12923347998204, -0.04625736007561, 4482777.06],
+  [3.09191371068437e-9, 0.000008983055096812155, 0.00006995724062, 23.10934304144901, -0.00023663490511, -0.6321817810242, -0.00663494467273, 0.03430082397953, -0.00466043876332, 2555164.4],
+  [2.890871144776878e-9, 0.000008983055095805407, -3.068298e-8, 7.47137025468032, -0.00000353937994, -0.02145144861037, -0.00001234426596, 0.00010322952773, -0.00000323890364, 826088.5],
+];
+
+function bd09McToBd09(x: number, y: number): { lng: number; lat: number } {
+  let f: number[] = MC_TO_LL[MC_TO_LL.length - 1] ?? [];
+  for (let i = 0; i < MC_BAND.length; i++) {
+    const band = MC_BAND[i];
+    const row = MC_TO_LL[i];
+    if (band !== undefined && row !== undefined && Math.abs(y) >= band) {
+      f = row;
+      break;
+    }
+  }
+  const [c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0, c8 = 0, c9 = 1] = f;
+  const cc = Math.abs(y) / c9;
+  let xt = c0 + c1 * Math.abs(x);
+  let yt = c2 + c3 * cc + c4 * cc ** 2 + c5 * cc ** 3 + c6 * cc ** 4 + c7 * cc ** 5 + c8 * cc ** 6;
+  xt *= x < 0 ? -1 : 1;
+  yt *= y < 0 ? -1 : 1;
+  return { lng: xt, lat: yt };
+}
+
+function bd09ToGcj02(lon: number, lat: number): { lng: number; lat: number } {
+  const factor = (Math.PI * 3000.0) / 180.0;
+  const x = lon - 0.0065;
+  const y = lat - 0.006;
+  const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * factor);
+  const theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * factor);
+  return { lng: z * Math.cos(theta), lat: z * Math.sin(theta) };
+}
+
+const GCJ_A = 6378245;
+const GCJ_EE = 0.006693421622965823;
+
+function gcjTransformLat(x: number, y: number): number {
+  let ret = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  ret += ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
+  ret += ((20 * Math.sin(y * Math.PI) + 40 * Math.sin((y / 3) * Math.PI)) * 2) / 3;
+  ret += ((160 * Math.sin((y / 12) * Math.PI) + 320 * Math.sin((y * Math.PI) / 30)) * 2) / 3;
+  return ret;
+}
+
+function gcjTransformLon(x: number, y: number): number {
+  let ret = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  ret += ((20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2) / 3;
+  ret += ((20 * Math.sin(x * Math.PI) + 40 * Math.sin((x / 3) * Math.PI)) * 2) / 3;
+  ret += ((150 * Math.sin((x / 12) * Math.PI) + 300 * Math.sin((x / 30) * Math.PI)) * 2) / 3;
+  return ret;
+}
+
+function gcjDelta(lon: number, lat: number): { dLon: number; dLat: number } {
+  let dLon = gcjTransformLon(lon - 105, lat - 35);
+  let dLat = gcjTransformLat(lon - 105, lat - 35);
+  const radLat = (lat / 180) * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - GCJ_EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLon = (dLon * 180) / ((GCJ_A / sqrtMagic) * Math.cos(radLat) * Math.PI);
+  dLat = (dLat * 180) / (((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtMagic)) * Math.PI);
+  return { dLon, dLat };
+}
+
+function gcj02ToWgs84(lon: number, lat: number): { lng: number; lat: number } {
+  let wgsLon = lon;
+  let wgsLat = lat;
+  for (let i = 0; i < 10; i++) {
+    const { dLon, dLat } = gcjDelta(wgsLon, wgsLat);
+    const dx = wgsLon + dLon - lon;
+    const dy = wgsLat + dLat - lat;
+    if (Math.abs(dx) <= 1e-6 && Math.abs(dy) <= 1e-6) break;
+    wgsLon -= dx;
+    wgsLat -= dy;
+  }
+  return { lng: wgsLon, lat: wgsLat };
+}
+
+/** Baidu Mercator point (meters, as returned by map.baidu.com) → WGS-84. */
+function baiduMcToWgs84(x: number, y: number): { lng: number; lat: number } {
+  const bd = bd09McToBd09(x, y);
+  const gcj = bd09ToGcj02(bd.lng, bd.lat);
+  return gcj02ToWgs84(gcj.lng, gcj.lat);
+}
+
+type FindPlaceCandidate = {
+  name: string;
+  address: string;
+  lat: number;
+  lng: number;
+  source: "baidu";
+};
+
+// Baidu 공개 웹 검색 1회. 실패하면 빈 배열을 돌려준다(호출부가
+// 후보 없음으로 처리).
+async function baiduPlaceSearch(query: string): Promise<FindPlaceCandidate[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const url =
+      `https://map.baidu.com/?qt=s&c=1&rn=10&ie=utf-8&wd=` +
+      encodeURIComponent(query);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        Referer: "https://map.baidu.com/",
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { content?: unknown };
+    const rows = Array.isArray(data.content) ? data.content : [];
+    const out: FindPlaceCandidate[] = [];
+    for (const r of rows) {
+      if (!r || typeof r !== "object") continue;
+      const row = r as { name?: unknown; addr?: unknown; x?: unknown; y?: unknown };
+      const name = typeof row.name === "string" ? row.name.trim() : "";
+      const x = Number(row.x);
+      const y = Number(row.y);
+      if (!name || !Number.isFinite(x) || !Number.isFinite(y) || x === 0 || y === 0) continue;
+      // Baidu's x/y are Mercator meters × 100.
+      const { lng, lat } = baiduMcToWgs84(x / 100, y / 100);
+      const addr = typeof row.addr === "string" ? row.addr.trim() : "";
+      out.push({ name, address: addr || name, lat, lng, source: "baidu" });
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// find-places 본체: 쿼리를 최대 4개까지 순서대로 검색하고, 같은
+// 이름+좌표 후보는 한 번만 남긴다.
+async function findPlaces(queries: string[]): Promise<FindPlaceCandidate[]> {
+  const seen = new Set<string>();
+  const out: FindPlaceCandidate[] = [];
+  for (const q of queries.slice(0, 4)) {
+    const hits = await baiduPlaceSearch(q);
+    for (const h of hits) {
+      const key = `${h.name}|${h.lat.toFixed(5)}|${h.lng.toFixed(5)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(h);
+    }
+  }
+  return out;
+}
+
+// === 이름 해석 (resolve-place): 한글 이름 → 현지 이름 제안 + 실측 검증 ===
+// 한글 이름(예: "데모레스 호텔")은 Baidu·OSM 어디에도 그 표기
+// 그대로는 없어서 직접 검색이 안 된다. 그래서 2단계로 찾는다.
+//   1단계: Gemini가 현지(중국어) 정식 이름·중국어 주소·영어 이름을
+//          제안한다. 먼저 Google Search 그라운딩을 붙여 시도하고,
+//          API가 도구 자체를 거부하면 그라운딩 없이 다시 시도한다.
+//   2단계: 제안을 Baidu 검색으로 조회해, 이름 핵심이나 주소의
+//          도로명+번지가 실제로 일치하는 POI만 후보로 인정한다.
+// 검증되지 않은 제안으로는 후보를 만들지 않는다.
+
+// === RESOLVE CORE START ===
+// 아래 구간은 순수 JS(타입 표기 없음)입니다. Node 테스트에서 그대로
+// 추출해 실행할 수 있게 유지하세요.
+
+// 현지 이름의 핵심 부분: 지점 안내 괄호 앞부분만 남긴다.
+// 예: "黛茂诗酒店(上海豫园老西门地铁站店)" → "黛茂诗酒店"
+function corePlaceName(name) {
+  return String(name ?? "")
+    .split(/[（(]/)[0]
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+// 중국어 주소에서 도로명+번지 토큰을 뽑는다.
+// 예: "上海市黄浦区中华路1465号" → "中华路1465号"
+// 도로 접미사+번지 위치를 먼저 찾고, 접미사 바로 앞의 한자를
+// 거슬러 올라가 도로명만 잡는다(행정구역 접두사가 딸려 오면
+// POI 주소 표기와 어긋나 대조가 실패하기 때문). 경계 글자
+// (市·区·县·镇·乡·省)에서는 거슬러 올라가기를 멈춘다.
+// 도로 접미사가 없으면 번지 토큰만이라도 돌려준다.
+function addressRoadToken(address) {
+  const s = String(address ?? "").replace(/\s+/g, "");
+  const m = s.match(/(路|街|大道|巷|弄|胡同)(\d+(?:-\d+)?号)/);
+  if (m && m.index !== undefined) {
+    const BOUNDARY = "市区县镇乡省";
+    let start = m.index;
+    let count = 0;
+    while (start > 0 && count < 4) {
+      const ch = s[start - 1];
+      if (!/[一-鿿]/.test(ch) || BOUNDARY.includes(ch)) break;
+      start--;
+      count++;
+    }
+    return s.slice(start, m.index) + m[1] + m[2];
+  }
+  const n = s.match(/(\d+(?:-\d+)?号)/);
+  return n ? n[1] : "";
+}
+
+// Gemini가 돌려준 텍스트에서 제안 JSON을 꺼낸다. 순수 JSON,
+// 코드펜스, 설명 문장에 섞인 JSON을 모두 허용한다.
+// JSON은 읽혔지만 현지 이름이 비어 있으면(null 등) "모름"으로 보고
+// null을 돌려주고, JSON 자체를 못 읽어도 null을 돌려준다
+// (둘의 구분은 호출부가 텍스트에 객체가 있었는지로 판단한다).
+function parseResolveSuggestionText(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch { /* 아래 폴백으로 */ }
+  if (!parsed || typeof parsed !== "object") {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        parsed = JSON.parse(raw.slice(start, end + 1));
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const clean = (v) =>
+    typeof v === "string" && v.trim() &&
+      v.trim().toLowerCase() !== "null"
+      ? v.trim()
+      : "";
+  const local = clean(parsed.local_name);
+  if (!local) return null;
+  return {
+    local_name: local,
+    address: clean(parsed.address),
+    english_name: clean(parsed.english_name),
+  };
+}
+
+// Baidu POI가 Gemini 제안과 같은 장소인지 판정한다.
+// 이름: POI 이름의 핵심에 제안 현지명의 핵심이 들어 있거나 그 반대.
+// 주소: POI 주소에 제안 주소의 도로명+번지 토큰이 들어 있으면 일치.
+function poiMatchesSuggestion(poi, suggestion) {
+  if (!poi || !suggestion) return false;
+  const poiCore = corePlaceName(poi.name);
+  const sugCore = corePlaceName(suggestion.local_name);
+  if (sugCore.length >= 2 && poiCore) {
+    if (poiCore.includes(sugCore) || sugCore.includes(poiCore)) return true;
+  }
+  const token = addressRoadToken(suggestion.address);
+  if (token) {
+    const poiAddr = String(poi.address ?? "").replace(/\s+/g, "");
+    if (poiAddr.includes(token)) return true;
+  }
+  return false;
+}
+
+// resolve-place 본체. suggest(name, city)는 Gemini 제안 함수,
+// search(query)는 Baidu 검색 함수로 주입받는다(테스트에서 스텁 교체).
+// city는 Baidu 쿼리용으로 정규화된 도시명(중국어 표기)을 받는다.
+async function resolvePlaceCore(name, city, suggest, search) {
+  const outcome = await suggest(name, city);
+  if (!outcome || outcome.status !== "ok") {
+    const status = outcome?.status ?? "error";
+    const reason = status === "no_key"
+      ? "AI 이름 찾기가 설정돼 있지 않아요."
+      : status === "timeout"
+      ? "AI 이름 찾기가 시간 초과로 실패했어요."
+      : "AI 이름 찾기에 실패했어요.";
+    return { ok: false, reason };
+  }
+  const sug = outcome.suggestion;
+  if (!sug || !sug.local_name) {
+    return { ok: false, reason: "이 이름으로는 현지 이름을 찾지 못했어요." };
+  }
+  const queries = [];
+  queries.push(city ? `${sug.local_name} ${city}` : sug.local_name);
+  if (sug.address) queries.push(sug.address);
+  const seen = new Set();
+  const candidates = [];
+  for (const q of queries) {
+    const hits = (await search(q)) ?? [];
+    for (const h of hits) {
+      if (!poiMatchesSuggestion(h, sug)) continue;
+      const key = `${h.name}|${Number(h.lat).toFixed(5)}|${Number(h.lng).toFixed(5)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(h);
+    }
+  }
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      reason: "제안받은 현지 이름으로 실제 장소를 확인하지 못했어요.",
+    };
+  }
+  return {
+    ok: true,
+    resolved: {
+      local_name: sug.local_name,
+      address: sug.address ?? "",
+      english_name: sug.english_name ?? "",
+    },
+    candidates,
+  };
+}
+
+// === RESOLVE CORE END ===
+
+// Baidu 쿼리에 붙일 도시명: 한글 도시명은 중국어 표기로 바꾼다.
+// (Baidu는 한글 쿼리에 결과를 주지 않는 경우가 많다.)
+const RESOLVE_CITY_MAP: Record<string, string> = {
+  "상하이": "上海",
+  "상해": "上海",
+  "베이징": "北京",
+  "북경": "北京",
+  "광저우": "广州",
+  "선전": "深圳",
+  "심천": "深圳",
+  "청두": "成都",
+  "성도": "成都",
+  "충칭": "重庆",
+  "중경": "重庆",
+  "시안": "西安",
+  "서안": "西安",
+  "항저우": "杭州",
+  "항주": "杭州",
+  "난징": "南京",
+  "남경": "南京",
+  "쑤저우": "苏州",
+  "소주": "苏州",
+  "우한": "武汉",
+  "무한": "武汉",
+  "샤먼": "厦门",
+  "하문": "厦门",
+  "창사": "长沙",
+  "장사": "长沙",
+  "톈진": "天津",
+  "천진": "天津",
+  "홍콩": "香港",
+};
+
+function baiduCityName(city?: string): string | undefined {
+  const c = String(city ?? "").trim();
+  if (!c) return undefined;
+  return RESOLVE_CITY_MAP[c] ?? c;
+}
+
+type PlaceSuggestion = {
+  local_name: string;
+  address: string;
+  english_name: string;
+};
+
+type SuggestOutcome =
+  | { status: "ok"; suggestion: PlaceSuggestion | null }
+  | { status: Exclude<AiStatus, "ok">; error?: string };
+
+// 1회 시도 결과. httpStatus/toolError는 재시도와 그라운딩 폴백
+// 판단에만 쓰고, 바깥으로 내보내는 SuggestOutcome에는 포함하지 않는다.
+type SuggestAttemptOutcome = SuggestOutcome & {
+  httpStatus?: number;
+  toolError?: boolean;
+};
+
+function buildResolvePrompt(name: string, city?: string): string {
+  return `너는 중국 현지 장소 이름을 찾는 도우미다.
+한국어로 된 장소 이름이 주어지면, 그 장소의 중국 현지 정식 이름(간체자), 중국어 주소, 영어 이름을 찾아라.
+실제로 존재하는 장소라고 확신할 때만 답해라. 확신이 없으면 지어내지 말고 모든 필드를 null로 답해라.
+설명 없이 JSON 객체 하나만 출력해라. 형식: {"local_name": "黛茂诗酒店", "address": "上海市黄浦区中华路1465号", "english_name": "Demores Hotel"}
+모르면: {"local_name": null, "address": null, "english_name": null}
+
+[찾을 장소]
+이름: ${name}${city ? `\n도시: ${city}` : ""}`;
+}
+
+// Gemini 제안 호출 1회. 타임아웃은 시도마다 새로 건다.
+// useGrounding이면 Google Search 그라운딩 도구를 붙인다. 그라운딩
+// 사용 시에는 JSON 응답 강제(responseMimeType)를 걸지 않는다.
+// 그라운딩과 함께 쓰면 API가 거부할 수 있어, 프롬프트로만 JSON을
+// 요구하고 파싱 쪽(parseResolveSuggestionText)에서 관대하게 읽는다.
+async function attemptResolveSuggestion(
+  name: string,
+  city: string | undefined,
+  apiKey: string,
+  useGrounding: boolean,
+): Promise<SuggestAttemptOutcome> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const requestBody: Record<string, unknown> = {
+      contents: [{ parts: [{ text: buildResolvePrompt(name, city) }] }],
+      generationConfig: {
+        // 추출 작업이라 깊은 추론이 필요 없어 LOW로 둔다.
+        thinkingConfig: { thinkingLevel: "LOW" },
+        maxOutputTokens: 512,
+        ...(useGrounding ? {} : { responseMimeType: "application/json" }),
+      },
+    };
+    if (useGrounding) {
+      requestBody.tools = [{ google_search: {} }];
+    }
+    const res = await fetch(geminiEndpoint(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify(requestBody),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      // Gemini 오류 본문에서 핵심 메시지만 뽑아 원인으로 남긴다.
+      let detail = "";
+      try {
+        const errText = await res.text();
+        try {
+          const errJson = JSON.parse(errText);
+          detail = String(
+            errJson?.error?.message ?? errJson?.error?.status ?? "",
+          );
+        } catch {
+          detail = errText;
+        }
+      } catch {
+        // 오류 본문조차 못 읽으면 상태 코드만으로 충분하다
+      }
+      const aiError = scrubApiKey(
+        `HTTP ${res.status}${detail ? `: ${detail}` : ""}`,
+        apiKey,
+      ).slice(0, 200);
+      logAiFailure("error", aiError);
+      // 그라운딩 도구 자체가 거부된 경우(400 등)는 호출부가 그라운딩
+      // 없이 다시 시도할 수 있게 표시해 둔다.
+      const toolError = useGrounding &&
+        (res.status === 400 || /tool|grounding|google_search/i.test(detail));
+      return {
+        status: "error",
+        error: aiError,
+        httpStatus: res.status,
+        toolError,
+      };
+    }
+    let data: {
+      candidates?: { content?: { parts?: { text?: unknown }[] } }[];
+    };
+    try {
+      data = await res.json();
+    } catch {
+      logAiFailure("bad_response", "response_not_json");
+      return { status: "bad_response", error: "response_not_json" };
+    }
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) {
+      logAiFailure("bad_response", "no_content_parts");
+      return { status: "bad_response", error: "no_content_parts" };
+    }
+    const textOut = parts
+      .map((p: { text?: unknown }) =>
+        typeof p?.text === "string" ? p.text : ""
+      )
+      .join("")
+      .trim();
+    if (!textOut) {
+      logAiFailure("bad_response", "empty_model_output");
+      return { status: "bad_response", error: "empty_model_output" };
+    }
+    const parsed = parseResolveSuggestionText(textOut) as
+      | PlaceSuggestion
+      | null;
+    if (parsed) return { status: "ok", suggestion: parsed };
+    // JSON 객체는 있는데 현지 이름이 비어 있으면 "모름"이다.
+    if (/\{[\s\S]*\}/.test(textOut)) {
+      return { status: "ok", suggestion: null };
+    }
+    logAiFailure("bad_response", "model_output_not_json");
+    return { status: "bad_response", error: "model_output_not_json" };
+  } catch (e) {
+    // 타임아웃(AbortController 중단)과 그 밖의 네트워크 오류를 구분한다.
+    const aborted = ctrl.signal.aborted ||
+      (e instanceof Error && e.name === "AbortError");
+    if (aborted) {
+      const aiError = `timeout_after_${GEMINI_TIMEOUT_MS}ms`;
+      logAiFailure("timeout", aiError);
+      return { status: "timeout", error: aiError };
+    }
+    const aiError = scrubApiKey(
+      e instanceof Error ? e.message : String(e),
+      apiKey,
+    ).slice(0, 200);
+    logAiFailure("error", aiError);
+    return { status: "error", error: aiError };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 제안 호출에 기존 타임아웃/재시도 정책을 적용한다.
+// 일시 오류(503·429·타임아웃)면 잠깐 쉬고 1회만 재시도한다.
+// 도구 오류는 같은 방식으로 재시도해도 반복되므로 바로 돌려줘서
+// 호출부가 그라운딩 없는 방식으로 넘어가게 한다.
+async function attemptResolveWithRetry(
+  name: string,
+  city: string | undefined,
+  apiKey: string,
+  useGrounding: boolean,
+): Promise<SuggestAttemptOutcome> {
+  let lastOutcome: SuggestAttemptOutcome = {
+    status: "error",
+    error: "not_attempted",
+  };
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+    const outcome = await attemptResolveSuggestion(
+      name,
+      city,
+      apiKey,
+      useGrounding,
+    );
+    if (outcome.status === "ok") return outcome;
+    lastOutcome = outcome;
+    if (outcome.toolError) return outcome;
+    const retryable = outcome.status === "timeout" ||
+      outcome.httpStatus === 503 || outcome.httpStatus === 429;
+    if (!retryable || attempt >= GEMINI_MAX_ATTEMPTS) break;
+    await new Promise((resolve) =>
+      setTimeout(resolve, GEMINI_RETRY_DELAY_MS)
+    );
+  }
+  return lastOutcome;
+}
+
+// Gemini에게 현지 이름 제안을 받는다. 먼저 Google Search
+// 그라운딩으로 시도하고, API가 도구 자체를 거부(toolError)하면
+// 그라운딩 없이 한 번 더 시도한다.
+async function suggestPlaceLocalName(
+  name: string,
+  city?: string,
+): Promise<SuggestOutcome> {
+  const apiKey = geminiApiKey();
+  if (!apiKey) {
+    logAiFailure("no_key", "GEMINI_API_KEY not set");
+    return { status: "no_key" };
+  }
+  let outcome = await attemptResolveWithRetry(name, city, apiKey, true);
+  if (outcome.toolError) {
+    outcome = await attemptResolveWithRetry(name, city, apiKey, false);
+  }
+  if (outcome.status === "ok") return outcome;
+  const { httpStatus, toolError, ...rest } = outcome;
+  return rest;
+}
+
+// resolve-place 본체: Gemini 제안을 Baidu 실측으로 검증한다.
+// 도시명은 Baidu 쿼리에 쓸 수 있게 중국어 표기로 정규화해서
+// 코어에 넘긴다(Gemini 프롬프트에도 그대로 쓰인다).
+async function resolvePlace(name: string, city?: string) {
+  const queryCity = baiduCityName(city);
+  return resolvePlaceCore(
+    name,
+    queryCity,
+    suggestPlaceLocalName,
+    baiduPlaceSearch,
+  );
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -1330,9 +1930,58 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ ok: false, reason: "POST 요청만 지원합니다." }, 405);
   }
 
+  let body: {
+    url?: unknown;
+    action?: unknown;
+    queries?: unknown;
+    name?: unknown;
+    city?: unknown;
+  };
+  try {
+    body = await req.json();
+  } catch {
+    return jsonResponse({ ok: false, reason: "올바른 링크 주소를 넣어 주세요." }, 400);
+  }
+
+  // 장소 검색 모드: action이 "find-places"면 링크 추출이 아니라
+  // 장소 이름 검색으로 동작한다. 이 경로는 사용자가 준 URL을
+  // 가져오는 게 아니라 코드에 고정된 Baidu 주소만 호출하므로,
+  // 아래 SSRF 허용 목록 검사를 적용하지 않는다.
+  if (body?.action === "find-places") {
+    const queries = (Array.isArray(body.queries) ? body.queries : [])
+      .filter((q): q is string => typeof q === "string")
+      .map((q) => q.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (queries.length === 0) {
+      return jsonResponse(
+        { ok: false, reason: "검색할 장소 이름(queries)이 필요합니다." },
+        400,
+      );
+    }
+    const candidates = await findPlaces(queries);
+    return jsonResponse({ ok: true, candidates });
+  }
+
+  // 이름 해석 모드: action이 "resolve-place"면 한글 이름만으로
+  // 중국 장소를 찾는다. Gemini가 현지 이름을 제안하고 Baidu
+  // 실측으로 검증된 후보만 돌려주므로, 이 경로도 사용자가 준
+  // URL을 가져오지 않아 SSRF 허용 목록 검사를 적용하지 않는다.
+  if (body?.action === "resolve-place") {
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) {
+      return jsonResponse(
+        { ok: false, reason: "찾을 장소 이름(name)이 필요합니다." },
+        400,
+      );
+    }
+    const city = typeof body.city === "string" ? body.city.trim() : "";
+    const result = await resolvePlace(name, city || undefined);
+    return jsonResponse(result);
+  }
+
   let url: URL;
   try {
-    const body = await req.json();
     if (!body?.url || typeof body.url !== "string") {
       return jsonResponse({ ok: false, reason: "url이 필요합니다." }, 400);
     }
