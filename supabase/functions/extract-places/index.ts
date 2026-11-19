@@ -1507,7 +1507,7 @@ async function findPlaces(queries: string[]): Promise<FindPlaceCandidate[]> {
 // 그대로는 없어서 직접 검색이 안 된다. 그래서 2단계로 찾는다.
 //   1단계: Gemini가 현지(중국어) 정식 이름·중국어 주소·영어 이름을
 //          제안한다. 먼저 Google Search 그라운딩을 붙여 시도하고,
-//          API가 도구 자체를 거부하면 그라운딩 없이 다시 시도한다.
+//          실패하면(원인 무관) 그라운딩 없이 다시 시도한다.
 //   2단계: 제안을 Baidu 검색으로 조회해, 이름 핵심이나 주소의
 //          도로명+번지가 실제로 일치하는 POI만 후보로 인정한다.
 // 검증되지 않은 제안으로는 후보를 만들지 않는다.
@@ -1619,7 +1619,15 @@ async function resolvePlaceCore(name, city, suggest, search) {
       : status === "timeout"
       ? "AI 이름 찾기가 시간 초과로 실패했어요."
       : "AI 이름 찾기에 실패했어요.";
-    return { ok: false, reason };
+    // 진단용으로 추출 경로와 같은 형식(ai_status/ai_error)을 함께
+    // 실어 보낸다. error는 제안 단계에서 이미 키 값을 지우고
+    // 200자로 줄인 문자열이다.
+    return {
+      ok: false,
+      reason,
+      ai_status: status,
+      ...(outcome?.error ? { ai_error: outcome.error } : {}),
+    };
   }
   const sug = outcome.suggestion;
   if (!sug || !sug.local_name) {
@@ -1882,8 +1890,10 @@ async function attemptResolveWithRetry(
 }
 
 // Gemini에게 현지 이름 제안을 받는다. 먼저 Google Search
-// 그라운딩으로 시도하고, API가 도구 자체를 거부(toolError)하면
-// 그라운딩 없이 한 번 더 시도한다.
+// 그라운딩으로 시도하고, 결과가 ok가 아니면(도구 거부·과부하·
+// 응답 파싱 실패 등 원인을 가리지 않고) 그라운딩 없이 한 번 더
+// 시도한다. 각 방식 안에서는 기존 재시도 정책이 그대로 적용되고,
+// 최종 결과는 마지막 시도(그라운딩 없는 시도)의 outcome이다.
 async function suggestPlaceLocalName(
   name: string,
   city?: string,
@@ -1894,7 +1904,7 @@ async function suggestPlaceLocalName(
     return { status: "no_key" };
   }
   let outcome = await attemptResolveWithRetry(name, city, apiKey, true);
-  if (outcome.toolError) {
+  if (outcome.status !== "ok") {
     outcome = await attemptResolveWithRetry(name, city, apiKey, false);
   }
   if (outcome.status === "ok") return outcome;
