@@ -1051,6 +1051,7 @@ function bkGeoCandsHtml(b) {
     ${cands.map((c, i) => `
       <div class="geo-cand" data-bk-geo-pick="${b.id}:${i}">
         <div class="item-title">${esc(c.name)}</div>
+        ${c.nameKo ? `<div class="muted">${esc(c.nameKo)}</div>` : ''}
         ${c.nameEn ? `<div class="muted">${esc(c.nameEn)}</div>` : ''}
         ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
         <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
@@ -1239,6 +1240,7 @@ function renderBkFormGeo() {
         ${bkFormGeoState.cands.map((c, i) => `
           <div class="geo-cand" data-bkform-geo-pick="${i}">
             <div class="item-title">${esc(c.name)}</div>
+            ${c.nameKo ? `<div class="muted">${esc(c.nameKo)}</div>` : ''}
             ${c.nameEn ? `<div class="muted">${esc(c.nameEn)}</div>` : ''}
             ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
             <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
@@ -1645,6 +1647,7 @@ function geoCandsHtml(p) {
     ${cands.map((c, i) => `
       <div class="geo-cand" data-geo-pick="${p.id}:${i}">
         <div class="item-title">${esc(c.name)}</div>
+        ${c.nameKo ? `<div class="muted">${esc(c.nameKo)}</div>` : ''}
         ${c.nameEn ? `<div class="muted">${esc(c.nameEn)}</div>` : ''}
         ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
         <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
@@ -1865,6 +1868,7 @@ function geoAddHit(byKey, h, variants, ctx) {
   byKey.set(key, {
     name: candName,
     nameEn: String(h.name_en || '').trim(),
+    nameKo: String(h.name_ko || '').trim(),
     address: h.display_name || '',
     region: geoRegionLabel(h),
     lat, lng, score,
@@ -1894,10 +1898,11 @@ function geoTripIsChina() {
   return !!(city && city.china);
 }
 
-// Baidu 후보 { name, address, lat, lng, name_en? }를 Nominatim 결과 형태로 맞춘다.
-// 주소는 문자열이라 구조화 주소(address 객체)에는 넣지 않고 display_name으로만 쓴다.
-// baidu 표식은 도시 필터를 Nominatim보다 느슨하게 적용하기 위한 것이다
-// (geoPassesCity 참고). name_en은 영어 이름이 있을 때만 카드에 함께 보여 준다.
+// Baidu 후보 { name, address, lat, lng, name_en?, name_ko? }를 Nominatim 결과
+// 형태로 맞춘다. 주소는 문자열이라 구조화 주소(address 객체)에는 넣지 않고
+// display_name으로만 쓴다. baidu 표식은 도시 필터를 Nominatim보다 느슨하게
+// 적용하기 위한 것이다(geoPassesCity 참고). name_en/name_ko는 영어·한국어
+// 이름이 있을 때만 카드에 함께 보여 준다.
 function baiduHitAdapter(c) {
   if (!c) return null;
   const lat = Number(c.lat);
@@ -1909,6 +1914,7 @@ function baiduHitAdapter(c) {
     lat, lon: lng,
     name,
     name_en: String(c.name_en || '').trim(),
+    name_ko: String(c.name_ko || '').trim(),
     display_name: String(c.address || name).trim(),
     address: null,
     baidu: true,
@@ -1983,6 +1989,7 @@ function geoAddAddrHit(byKey, h, tokens, ctx) {
   byKey.set(key, {
     name: candName,
     nameEn: String(h.name_en || '').trim(),
+    nameKo: String(h.name_ko || '').trim(),
     address: h.display_name || '',
     region: geoRegionLabel(h),
     lat, lng, score: 0.6,
@@ -2028,6 +2035,7 @@ function geoAddAiHit(byKey, h, ctx, localName, englishName) {
   byKey.set(key, {
     name: candName,
     nameEn: String(h.name_en || '').trim(),
+    nameKo: String(h.name_ko || '').trim(),
     address: h.display_name || '',
     region: geoRegionLabel(h),
     lat, lng, score: 0.7,
