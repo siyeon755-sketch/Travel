@@ -31,11 +31,12 @@
 //
 // 이름 해석 모드: POST { action: "resolve-place", name, city? } 로
 // 오면 한글 이름만으로 중국 장소를 찾는다. Gemini가 현지(중국어)
-// 정식 이름·중국어 주소를 제안하고, 그 제안을 Baidu 검색으로 실측
-// 검증해 일치하는 POI만 { ok: true, resolved, candidates } 로
-// 돌려준다. candidates에도 find-places와 같은 name_en(영어 표기)과
-// name_ko(한국어 표기)가 붙는다. 제안이 없거나 검증에 실패하면 후보를 만들지 않고
-// { ok: false, reason } 을 돌려준다 (지어낸 핀 금지).
+// 정식 이름 후보를 최대 3개까지 제안하고, 각 제안을 Baidu 검색으로
+// 실측 검증해 이름이 일치하는 POI만 { ok: true, resolved,
+// candidates } 로 돌려준다. candidates에도 find-places와 같은
+// name_en(영어 표기)과 name_ko(한국어 표기)가 붙는다. 제안이 없거나
+// 검증에 실패하면 후보를 만들지 않고 { ok: false, reason } 을
+// 돌려준다 (지어낸 핀 금지).
 //
 // 인증: Verify JWT 기본값(켜짐) 유지 전제. 로그인한 사용자만
 // 호출할 수 있고, 이 함수 안에서 별도 JWT 검사는 하지 않습니다.
@@ -1865,11 +1866,16 @@ async function addEnglishNames(
 // === 이름 해석 (resolve-place): 한글 이름 → 현지 이름 제안 + 실측 검증 ===
 // 한글 이름(예: "데모레스 호텔")은 Baidu·OSM 어디에도 그 표기
 // 그대로는 없어서 직접 검색이 안 된다. 그래서 2단계로 찾는다.
-//   1단계: Gemini가 현지(중국어) 정식 이름·중국어 주소·영어 이름을
-//          제안한다. 먼저 Google Search 그라운딩을 붙여 시도하고,
-//          실패하면(원인 무관) 그라운딩 없이 다시 시도한다.
-//   2단계: 제안을 Baidu 검색으로 조회해, 이름 핵심이나 주소의
-//          도로명+번지가 실제로 일치하는 POI만 후보로 인정한다.
+//   1단계: Gemini가 현지(중국어) 정식 이름 후보를 최대 3개까지
+//          제안한다(병음 발음이 가까운 순). 먼저 Google Search
+//          그라운딩을 붙여 시도하고, 실패하면(원인 무관) 그라운딩
+//          없이 다시 시도한다.
+//   2단계: 각 제안을 Baidu 검색으로 조회해, 이름이 실제로
+//          일치하는 POI만 후보로 인정한다. 주소만 일치한 POI
+//          (같은 주소의 다른 입점 업체 등)는 이름 일치 후보가
+//          있으면 버리고, 이름 일치가 전혀 없을 때만 제안 주소
+//          문자열에 이름이 그대로 들어 있는 건물 POI 1개를
+//          예외로 허용한다.
 // 검증되지 않은 제안으로는 후보를 만들지 않는다.
 
 // === RESOLVE CORE START ===
@@ -1913,10 +1919,12 @@ function addressRoadToken(address) {
 
 // Gemini가 돌려준 텍스트에서 제안 JSON을 꺼낸다. 순수 JSON,
 // 코드펜스, 설명 문장에 섞인 JSON을 모두 허용한다.
-// JSON은 읽혔지만 현지 이름이 비어 있으면(null 등) "모름"으로 보고
-// null을 돌려주고, JSON 자체를 못 읽어도 null을 돌려준다
-// (둘의 구분은 호출부가 텍스트에 객체가 있었는지로 판단한다).
-function parseResolveSuggestionText(text) {
+// 반환값은 제안 배열(우선순위 순, 최대 3개, 이름 핵심 기준 중복
+// 제거)이다. JSON 객체 자체를 못 읽으면 null, 읽었지만 현지
+// 이름이 있는 후보가 하나도 없으면 빈 배열("모름")을 돌려준다.
+// 신형 형식 {"candidates": [{local_name, address, english_name}]}
+// 과 구형 단일 형식 {"local_name": ...} 을 모두 받는다.
+function parseResolveSuggestionsText(text) {
   const raw = String(text ?? "").trim();
   if (!raw) return null;
   let parsed = null;
@@ -1940,36 +1948,84 @@ function parseResolveSuggestionText(text) {
       v.trim().toLowerCase() !== "null"
       ? v.trim()
       : "";
-  const local = clean(parsed.local_name);
-  if (!local) return null;
-  return {
-    local_name: local,
-    address: clean(parsed.address),
-    english_name: clean(parsed.english_name),
+  const toSuggestion = (obj) => {
+    if (!obj || typeof obj !== "object") return null;
+    const local = clean(obj.local_name);
+    if (!local) return null;
+    return {
+      local_name: local,
+      address: clean(obj.address),
+      english_name: clean(obj.english_name),
+    };
   };
+  const list = [];
+  const pushUnique = (s) => {
+    if (!s || list.length >= 3) return;
+    const core = corePlaceName(s.local_name);
+    if (list.some((x) => corePlaceName(x.local_name) === core)) return;
+    list.push(s);
+  };
+  if (Array.isArray(parsed.candidates)) {
+    for (const item of parsed.candidates) pushUnique(toSuggestion(item));
+  } else {
+    pushUnique(toSuggestion(parsed));
+  }
+  return list;
 }
 
-// Baidu POI가 Gemini 제안과 같은 장소인지 판정한다.
-// 이름: POI 이름의 핵심에 제안 현지명의 핵심이 들어 있거나 그 반대.
-// 주소: POI 주소에 제안 주소의 도로명+번지 토큰이 들어 있으면 일치.
-function poiMatchesSuggestion(poi, suggestion) {
+// 구형 단일 제안 파서(호환용): 다중 파서의 첫 후보만 돌려준다.
+function parseResolveSuggestionText(text) {
+  const list = parseResolveSuggestionsText(text);
+  return list && list.length > 0 ? list[0] : null;
+}
+
+// 이름 일치: POI 이름의 핵심에 제안 현지명의 핵심이 들어 있거나 그 반대.
+function poiNameMatchesSuggestion(poi, suggestion) {
   if (!poi || !suggestion) return false;
   const poiCore = corePlaceName(poi.name);
   const sugCore = corePlaceName(suggestion.local_name);
-  if (sugCore.length >= 2 && poiCore) {
-    if (poiCore.includes(sugCore) || sugCore.includes(poiCore)) return true;
-  }
-  const token = addressRoadToken(suggestion.address);
-  if (token) {
-    const poiAddr = String(poi.address ?? "").replace(/\s+/g, "");
-    if (poiAddr.includes(token)) return true;
-  }
-  return false;
+  if (sugCore.length < 2 || !poiCore) return false;
+  return poiCore.includes(sugCore) || sugCore.includes(poiCore);
 }
 
-// resolve-place 본체. suggest(name, city)는 Gemini 제안 함수,
+// 주소 일치: POI 주소에 제안 주소의 도로명+번지 토큰이 들어 있으면 일치.
+function poiAddressMatchesSuggestion(poi, suggestion) {
+  if (!poi || !suggestion) return false;
+  const token = addressRoadToken(suggestion.address);
+  if (!token) return false;
+  const poiAddr = String(poi.address ?? "").replace(/\s+/g, "");
+  return poiAddr.includes(token);
+}
+
+// Baidu POI가 Gemini 제안과 같은 장소인지 판정한다(이름 또는 주소 일치).
+function poiMatchesSuggestion(poi, suggestion) {
+  return poiNameMatchesSuggestion(poi, suggestion) ||
+    poiAddressMatchesSuggestion(poi, suggestion);
+}
+
+// 건물 예외: 제안 주소 문자열 안에 POI 이름 핵심이 그대로 들어
+// 있으면 그 POI는 제안이 가리키는 건물 자체로 본다(예: 주소
+// "…亚洲大厦2楼"에 대한 POI "亚洲大厦"). 이름 일치가 전혀 없을
+// 때만 쓰는 폴백이라, 짧은 이름의 우연한 포함을 막기 위해 이름
+// 핵심이 3자 이상일 때만 인정한다.
+function poiIsBuildingOfSuggestion(poi, suggestion) {
+  if (!poi || !suggestion) return false;
+  const poiCore = corePlaceName(poi.name);
+  if (poiCore.length < 3) return false;
+  const sugAddr = String(suggestion.address ?? "").replace(/\s+/g, "");
+  return sugAddr.includes(poiCore);
+}
+
+// resolve-place 본체. suggest(name, city)는 Gemini 제안 함수로,
+// 현지 이름 후보를 우선순위 순으로 최대 3개까지 돌려준다.
 // search(query)는 Baidu 검색 함수로 주입받는다(테스트에서 스텁 교체).
 // city는 Baidu 쿼리용으로 정규화된 도시명(중국어 표기)을 받는다.
+// 검증 규칙: 후보로 인정하려면 이름 일치가 있어야 한다. 주소만
+// 일치한 POI(같은 주소의 다른 입점 업체 등)는 버린다. 이름 일치가
+// 전혀 없을 때만, 제안 주소 문자열에 이름이 그대로 들어 있는 건물
+// POI 1개를 예외로 허용한다. resolved는 실제로 이름 일치로 검증된
+// 추측을 기준으로 하고(건물 예외만 성립하면 그 건물을 기준으로),
+// 먼저 검증된 추측이 있으면 뒤 추측은 더 조회하지 않는다.
 async function resolvePlaceCore(name, city, suggest, search) {
   const outcome = await suggest(name, city);
   if (!outcome || outcome.status !== "ok") {
@@ -1989,39 +2045,62 @@ async function resolvePlaceCore(name, city, suggest, search) {
       ...(outcome?.error ? { ai_error: outcome.error } : {}),
     };
   }
-  const sug = outcome.suggestion;
-  if (!sug || !sug.local_name) {
+  const suggestions = (Array.isArray(outcome.suggestions)
+    ? outcome.suggestions
+    : [])
+    .filter((s) => s && s.local_name)
+    .slice(0, 3);
+  if (suggestions.length === 0) {
     return { ok: false, reason: "이 이름으로는 현지 이름을 찾지 못했어요." };
   }
-  const queries = [];
-  queries.push(city ? `${sug.local_name} ${city}` : sug.local_name);
-  if (sug.address) queries.push(sug.address);
-  const seen = new Set();
-  const candidates = [];
-  for (const q of queries) {
-    const hits = (await search(q)) ?? [];
-    for (const h of hits) {
-      if (!poiMatchesSuggestion(h, sug)) continue;
-      const key = `${h.name}|${Number(h.lat).toFixed(5)}|${Number(h.lng).toFixed(5)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      candidates.push(h);
+  let buildingFallback = null;
+  for (const sug of suggestions) {
+    const queries = [];
+    queries.push(city ? `${sug.local_name} ${city}` : sug.local_name);
+    if (sug.address) queries.push(sug.address);
+    const seen = new Set();
+    const nameMatches = [];
+    for (const q of queries) {
+      const hits = (await search(q)) ?? [];
+      for (const h of hits) {
+        if (poiNameMatchesSuggestion(h, sug)) {
+          const key =
+            `${h.name}|${Number(h.lat).toFixed(5)}|${Number(h.lng).toFixed(5)}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          nameMatches.push(h);
+        } else if (!buildingFallback && poiIsBuildingOfSuggestion(h, sug)) {
+          buildingFallback = { poi: h };
+        }
+      }
+    }
+    if (nameMatches.length > 0) {
+      return {
+        ok: true,
+        resolved: {
+          local_name: sug.local_name,
+          address: sug.address ?? "",
+          english_name: sug.english_name ?? "",
+        },
+        candidates: nameMatches,
+      };
     }
   }
-  if (candidates.length === 0) {
+  if (buildingFallback) {
+    const poi = buildingFallback.poi;
     return {
-      ok: false,
-      reason: "제안받은 현지 이름으로 실제 장소를 확인하지 못했어요.",
+      ok: true,
+      resolved: {
+        local_name: corePlaceName(poi.name) || String(poi.name ?? ""),
+        address: String(poi.address ?? ""),
+        english_name: "",
+      },
+      candidates: [poi],
     };
   }
   return {
-    ok: true,
-    resolved: {
-      local_name: sug.local_name,
-      address: sug.address ?? "",
-      english_name: sug.english_name ?? "",
-    },
-    candidates,
+    ok: false,
+    reason: "제안받은 현지 이름으로 실제 장소를 확인하지 못했어요.",
   };
 }
 
@@ -2073,7 +2152,7 @@ type PlaceSuggestion = {
 };
 
 type SuggestOutcome =
-  | { status: "ok"; suggestion: PlaceSuggestion | null }
+  | { status: "ok"; suggestions: PlaceSuggestion[] }
   | { status: Exclude<AiStatus, "ok">; error?: string };
 
 // 1회 시도 결과. httpStatus/toolError는 재시도와 그라운딩 폴백
@@ -2085,10 +2164,12 @@ type SuggestAttemptOutcome = SuggestOutcome & {
 
 function buildResolvePrompt(name: string, city?: string): string {
   return `너는 중국 현지 장소 이름을 찾는 도우미다.
-한국어로 된 장소 이름이 주어지면, 그 장소의 중국 현지 정식 이름(간체자), 중국어 주소, 영어 이름을 찾아라.
-실제로 존재하는 장소라고 확신할 때만 답해라. 확신이 없으면 지어내지 말고 모든 필드를 null로 답해라.
-설명 없이 JSON 객체 하나만 출력해라. 형식: {"local_name": "黛茂诗酒店", "address": "上海市黄浦区中华路1465号", "english_name": "Demores Hotel"}
-모르면: {"local_name": null, "address": null, "english_name": null}
+한국어로 된 장소 이름이 주어지면, 그 장소의 중국 현지 정식 이름(간체자) 후보를 찾아라.
+한국어 표기는 중국어 병음 발음을 한국어로 옮긴 경우가 많다. 발음이 가장 가까운 간체자 표기를 첫 번째 후보로 하고, 발음이 비슷해 헷갈릴 수 있는 다른 표기가 있으면 최대 3개까지 후보를 제시해라.
+각 후보에는 알면 중국어 주소와 영어 이름도 적어라(모르면 null).
+실제로 존재할 법한 이름만 제시해라. 전혀 모르겠으면 candidates를 빈 배열로 답해라.
+설명 없이 JSON 객체 하나만 출력해라. 형식: {"candidates": [{"local_name": "黛茂诗酒店", "address": "上海市黄浦区中华路1465号", "english_name": "Demores Hotel"}]}
+모르면: {"candidates": []}
 
 [찾을 장소]
 이름: ${name}${city ? `\n도시: ${city}` : ""}`;
@@ -2098,7 +2179,7 @@ function buildResolvePrompt(name: string, city?: string): string {
 // useGrounding이면 Google Search 그라운딩 도구를 붙인다. 그라운딩
 // 사용 시에는 JSON 응답 강제(responseMimeType)를 걸지 않는다.
 // 그라운딩과 함께 쓰면 API가 거부할 수 있어, 프롬프트로만 JSON을
-// 요구하고 파싱 쪽(parseResolveSuggestionText)에서 관대하게 읽는다.
+// 요구하고 파싱 쪽(parseResolveSuggestionsText)에서 관대하게 읽는다.
 async function attemptResolveSuggestion(
   name: string,
   city: string | undefined,
@@ -2113,7 +2194,8 @@ async function attemptResolveSuggestion(
       generationConfig: {
         // 추출 작업이라 깊은 추론이 필요 없어 LOW로 둔다.
         thinkingConfig: { thinkingLevel: "LOW" },
-        maxOutputTokens: 512,
+        // 후보 최대 3개(주소 포함)를 담아야 해서 여유를 둔다.
+        maxOutputTokens: 1024,
         ...(useGrounding ? {} : { responseMimeType: "application/json" }),
       },
     };
@@ -2185,14 +2267,12 @@ async function attemptResolveSuggestion(
       logAiFailure("bad_response", "empty_model_output");
       return { status: "bad_response", error: "empty_model_output" };
     }
-    const parsed = parseResolveSuggestionText(textOut) as
-      | PlaceSuggestion
+    // 파서가 배열을 돌려주면(빈 배열 포함) JSON은 읽힌 것이다.
+    // 빈 배열은 "모름"이고, null은 JSON 객체 자체를 못 읽은 경우다.
+    const parsedList = parseResolveSuggestionsText(textOut) as
+      | PlaceSuggestion[]
       | null;
-    if (parsed) return { status: "ok", suggestion: parsed };
-    // JSON 객체는 있는데 현지 이름이 비어 있으면 "모름"이다.
-    if (/\{[\s\S]*\}/.test(textOut)) {
-      return { status: "ok", suggestion: null };
-    }
+    if (parsedList) return { status: "ok", suggestions: parsedList };
     logAiFailure("bad_response", "model_output_not_json");
     return { status: "bad_response", error: "model_output_not_json" };
   } catch (e) {
