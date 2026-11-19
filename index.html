@@ -371,6 +371,15 @@
         <h3>🔍 장소 찾기</h3>
         <input type="text" id="plSearch" placeholder="이름이나 메모로 검색">
         <div class="filter-chips" id="plCatChips"></div>
+        <button type="button" id="plPickToggle" class="secondary btn-block" style="margin-top:10px">☑ 여러 개 일정에 넣기</button>
+        <p id="plPickMsg" class="ok-msg" style="margin:8px 0 0"></p>
+      </div>
+      <div id="plPickBar" class="card hidden" style="position:sticky;top:8px;z-index:20">
+        <div class="row">
+          <select id="plPickDay" aria-label="넣을 날짜"></select>
+          <button type="button" id="plPickAdd" style="flex:0 0 auto" disabled>선택한 0개 넣기</button>
+        </div>
+        <p id="plPickCount" class="muted" style="margin:6px 0 0"></p>
       </div>
       <div id="placeList"></div>
     </div>
@@ -577,6 +586,7 @@ const state = {
   authMode: 'login',
   segCounter: 0,
   placeFilter: { q: '', category: '전체' }, // 장소 보관함 검색·카테고리 필터 (탭 이동에도 유지)
+  placePick: { on: false, ids: new Set(), day: 0 }, // 여러 개 일정에 넣기 선택 모드
 };
 
 // 날짜 유틸
@@ -1471,8 +1481,93 @@ function renderPlaceCatChips() {
   });
 }
 
+/* ---------- 여러 개 일정에 넣기 (선택 모드) ----------
+   선택은 state.placePick.ids에 쌓지만, 실제 넣기 대상은 지금 화면에
+   보이는(검색·카테고리 필터를 통과한) 장소 중 선택된 것만으로 한정한다.
+   필터로 숨겨진 장소가 선택에 남아 있어도 넣지 않는다. */
+function pickedPlaces() {
+  if (!state.placePick.on) return [];
+  return filterPlaces(state.places).filter(p => state.placePick.ids.has(p.id));
+}
+
+function renderPickBar() {
+  const bar = $('plPickBar');
+  const toggle = $('plPickToggle');
+  if (!bar || !toggle) return;
+  const pick = state.placePick;
+  toggle.textContent = pick.on ? '☑ 선택 모드 끄기' : '☑ 여러 개 일정에 넣기';
+  bar.classList.toggle('hidden', !pick.on);
+  if (!pick.on || !state.trip) return;
+  const n = dayCount(state.trip);
+  if (pick.day >= n) pick.day = 0;
+  const sel = $('plPickDay');
+  sel.innerHTML = Array.from({ length: n }, (_, i) =>
+    `<option value="${i}">${dayLabel(state.trip, i)}</option>`).join('');
+  sel.value = String(pick.day);
+  const count = pickedPlaces().length;
+  $('plPickCount').textContent = count
+    ? `지금 보이는 장소 중 ${count}개를 골랐어요.`
+    : '아래 목록에서 넣을 장소를 골라 주세요.';
+  const addBtn = $('plPickAdd');
+  addBtn.disabled = !count;
+  addBtn.textContent = `선택한 ${count}개 넣기`;
+}
+
+// 완료 메시지의 "M/D" 표기. 시작 날짜가 없으면 null.
+function dayMonthDay(trip, idx) {
+  if (!trip.start_date) return null;
+  const d = new Date(trip.start_date + 'T00:00:00');
+  d.setDate(d.getDate() + idx);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+// 선택한 장소들을 고른 날짜 일정의 맨 뒤에 한 번에 넣는다.
+// sort_order는 applyRouteOrder와 같은 방식: 그 날짜 기존 항목을 지금
+// 보이는 순서대로 0부터 확정하고, 새 항목은 그 뒤 번호를 받는다.
+// sort_order 컬럼이 없으면 번호 없이 넣는다(표시는 created_at 순이라
+// 기존 항목 뒤에 붙고, 단일 "일정에 넣기"와 같은 동작이 된다).
+async function addPickedPlaces() {
+  const targets = pickedPlaces();
+  if (!targets.length) return;
+  const day = state.placePick.day;
+  const tid = state.trip.id;
+  const existing = state.planItems.filter(p => p.day_index === day).sort(planOrderCmp);
+  showError('');
+  let noSortCol = false;
+  for (let i = 0; i < existing.length; i++) {
+    if (existing[i].sort_order === i) continue;
+    const { error } = await sb.from('plan_items')
+      .update({ sort_order: i }).eq('id', existing[i].id);
+    if (error) {
+      if (error.code === 'PGRST204' || /column/i.test(error.message || '')) { noSortCol = true; break; }
+      showError('일정에 넣기 실패: ' + error.message);
+      return;
+    }
+  }
+  const buildRows = (withSort) => targets.map((p, i) => {
+    const row = {
+      trip_id: tid, day_index: day,
+      title: p.name, memo: p.memo || '', created_by: state.user.id,
+    };
+    if (withSort) row.sort_order = existing.length + i;
+    return row;
+  });
+  let { error } = await sb.from('plan_items').insert(buildRows(!noSortCol));
+  if (error && !noSortCol && (error.code === 'PGRST204' || /sort_order/.test(error.message || ''))) {
+    ({ error } = await sb.from('plan_items').insert(buildRows(false)));
+  }
+  if (error) { showError('일정에 넣기 실패: ' + error.message); return; }
+  const when = dayMonthDay(state.trip, day) || `${day + 1}일차`;
+  const msg = `${targets.length}개 장소를 ${when} 일정에 넣었어요`;
+  state.placePick.on = false;
+  state.placePick.ids.clear();
+  await loadTripData();
+  $('plPickMsg').textContent = msg;
+}
+
 function renderPlaces() {
   renderLinkHistory();
+  renderPickBar();
   const box = $('placeList');
   if (!state.places.length) {
     box.innerHTML = '<div class="empty">아직 저장한 장소가 없습니다.<br>가고 싶은 장소를 위에 추가해 보세요.</div>';
@@ -1495,6 +1590,11 @@ function renderPlaces() {
         </div>
         <button class="danger small" data-del-place="${p.id}">삭제</button>
       </div>
+      ${state.placePick.on ? `
+      <label style="display:flex;align-items:center;gap:8px;margin:10px 0 0;font-size:14px">
+        <input type="checkbox" data-place-pick="${p.id}" ${state.placePick.ids.has(p.id) ? 'checked' : ''} style="width:20px;height:20px;flex:0 0 auto">
+        일정에 넣을 장소로 선택
+      </label>` : ''}
       ${placeLocHtml(p)}
       <div class="row" style="margin-top:10px">
         <select data-place-day="${p.id}">${dayOptions}</select>
@@ -1527,6 +1627,13 @@ function renderPlaces() {
       if (error) { showError('일정에 넣기 실패: ' + error.message); return; }
       await loadTripData();
       setTab('plan');
+    };
+  });
+  box.querySelectorAll('[data-place-pick]').forEach(cb => {
+    cb.onchange = () => {
+      if (cb.checked) state.placePick.ids.add(cb.dataset.placePick);
+      else state.placePick.ids.delete(cb.dataset.placePick);
+      renderPickBar();
     };
   });
   box.querySelectorAll('[data-geo-search]').forEach(b => {
@@ -1566,6 +1673,17 @@ $('plSearch').addEventListener('input', (e) => {
   state.placeFilter.q = e.target.value;
   renderPlaces();
 });
+
+$('plPickToggle').onclick = () => {
+  state.placePick.on = !state.placePick.on;
+  if (!state.placePick.on) state.placePick.ids.clear();
+  $('plPickMsg').textContent = '';
+  renderPlaces();
+};
+$('plPickDay').addEventListener('change', (e) => {
+  state.placePick.day = Number(e.target.value);
+});
+$('plPickAdd').onclick = () => addPickedPlaces();
 
 $('addPlaceBtn').onclick = async () => {
   const name = $('plName').value.trim();
