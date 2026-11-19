@@ -117,6 +117,18 @@
   .memo-src a { color: var(--brand); font-weight: 600; text-decoration: none; }
   .hist-summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
   .hist-full { margin-top: 4px; font-size: 13px; word-break: break-word; }
+  .oneline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  a.btn-link {
+    display: block; text-align: center; text-decoration: none; font-size: 14px;
+    font-weight: 700; border-radius: 10px; padding: 11px 14px;
+    background: #eef2f7; color: var(--text);
+  }
+  a.btn-link:hover { background: #e2e8f0; }
+  .geo-cand {
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    margin-top: 8px; cursor: pointer; background: #fbfcfe;
+  }
+  .geo-cand:hover { border-color: var(--brand); }
 </style>
 </head>
 <body>
@@ -255,6 +267,12 @@
         <label for="plMemo">메모</label>
         <input type="text" id="plMemo" placeholder="메모 (선택)">
         <button id="addPlaceBtn" class="btn-block">장소 저장</button>
+      </div>
+      <div class="card">
+        <h3>📍 위치 찾기</h3>
+        <p class="muted">저장한 장소의 실제 위치를 찾아 지도와 연결해 두면, 나중에 동선을 짤 때 쓸 수 있어요.</p>
+        <button id="bulkGeoBtn" class="btn-block secondary">전체 위치 찾기</button>
+        <p id="bulkGeoMsg" class="muted"></p>
       </div>
       <div id="placeList"></div>
     </div>
@@ -801,6 +819,7 @@ function renderPlaces() {
         </div>
         <button class="danger small" data-del-place="${p.id}">삭제</button>
       </div>
+      ${placeLocHtml(p)}
       <div class="row" style="margin-top:10px">
         <select data-place-day="${p.id}">${dayOptions}</select>
         <button class="secondary" data-place-add="${p.id}" style="flex:0 0 auto">일정에 넣기</button>
@@ -834,6 +853,36 @@ function renderPlaces() {
       setTab('plan');
     };
   });
+  box.querySelectorAll('[data-geo-search]').forEach(b => {
+    b.onclick = () => startGeoSearch(b.dataset.geoSearch);
+  });
+  box.querySelectorAll('[data-geo-clear]').forEach(b => {
+    b.onclick = async () => {
+      const ok = await updatePlaceLocation(b.dataset.geoClear,
+        { lat: null, lng: null, address: null, matched_name: null });
+      if (ok) {
+        delete geoState.cands[b.dataset.geoClear];
+        delete geoState.status[b.dataset.geoClear];
+        await loadTripData();
+      }
+    };
+  });
+  box.querySelectorAll('[data-geo-pick]').forEach(el => {
+    el.onclick = async () => {
+      const [pid, idx] = el.dataset.geoPick.split(':');
+      const cand = (geoState.cands[pid] || [])[Number(idx)];
+      if (!cand) return;
+      const ok = await updatePlaceLocation(pid, {
+        lat: cand.lat, lng: cand.lng,
+        address: cand.address, matched_name: cand.name,
+      });
+      if (ok) {
+        delete geoState.cands[pid];
+        delete geoState.status[pid];
+        await loadTripData();
+      }
+    };
+  });
 }
 
 $('addPlaceBtn').onclick = async () => {
@@ -848,6 +897,270 @@ $('addPlaceBtn').onclick = async () => {
   });
   if (error) { showError('장소 저장 실패: ' + error.message); return; }
   $('plName').value = ''; $('plMemo').value = '';
+  await loadTripData();
+};
+
+/* ============================================================
+   위치 찾기 (OpenStreetMap Nominatim, 브라우저에서 직접 호출)
+   - 후보는 이름 일치 게이트(0.5 미만 제외)를 통과한 것만 보여 준다.
+     Nominatim은 글자 몇 개만 겹치는 엉뚱한 장소도 돌려주기 때문이다.
+   - saved_places.lat/lng/address/matched_name 컬럼이 필요하다.
+   ============================================================ */
+const geoState = { cands: {}, status: {} }; // placeId -> 후보 배열 / 진행 상태
+
+function placeHasLoc(p) {
+  return p.lat != null && p.lng != null &&
+    Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng));
+}
+
+// 중국 여행이면 고덕지도(Amap), 아니면 Google 지도로 연다.
+function isChinaTrip() {
+  const t = `${state.trip?.destination || ''} ${state.trip?.name || ''}`;
+  return /중국|상하이|상해|베이징|청두|충칭|시안|광저우|선전|항저우|난징|홍콩|마카오|china|shanghai|beijing/i.test(t);
+}
+function mapSearchUrl(name) {
+  const q = encodeURIComponent(name || '');
+  return isChinaTrip()
+    ? `https://www.amap.com/search?query=${q}`
+    : `https://www.google.com/maps/search/?api=1&query=${q}`;
+}
+
+function placeLocHtml(p) {
+  let html = '';
+  if (placeHasLoc(p)) {
+    html += `<div style="margin-top:10px">
+      <span class="ok-msg">📍 위치 연결됨</span>
+      ${p.address ? `<div class="muted oneline" title="${esc(p.address)}">${esc(p.address)}</div>` : ''}
+      <div class="row" style="margin-top:8px">
+        <a class="btn-link" href="${esc(mapSearchUrl(p.matched_name || p.name))}" target="_blank" rel="noopener noreferrer">지도에서 보기</a>
+        <button class="secondary" data-geo-search="${p.id}" style="flex:0 0 auto">위치 다시 찾기</button>
+        <button class="danger" data-geo-clear="${p.id}" style="flex:0 0 auto">연결 해제</button>
+      </div>
+    </div>`;
+  } else {
+    html += `<div style="margin-top:10px">
+      <button class="secondary small" data-geo-search="${p.id}">📍 위치 찾기</button>
+    </div>`;
+  }
+  return html + geoCandsHtml(p);
+}
+
+function geoCandsHtml(p) {
+  if (geoState.status[p.id] === 'searching') {
+    return '<p class="muted" style="margin-top:8px">위치를 찾는 중...</p>';
+  }
+  const cands = geoState.cands[p.id];
+  if (!cands) return '';
+  if (!cands.length) {
+    return `<div style="margin-top:8px">
+      <p class="muted">후보를 찾지 못했어요. 지도에서 직접 찾아보세요.</p>
+      <a class="btn-link" href="${esc(mapSearchUrl(p.name))}" target="_blank" rel="noopener noreferrer">지도에서 찾기</a>
+    </div>`;
+  }
+  return `<div style="margin-top:8px">
+    <div class="muted">맞는 위치를 골라 주세요.</div>
+    ${cands.map((c, i) => `
+      <div class="geo-cand" data-geo-pick="${p.id}:${i}">
+        <div class="item-title">${esc(c.name)}</div>
+        <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
+        ${c.distanceKm != null ? `<div class="muted">숙소에서 약 ${c.distanceKm.toFixed(1)}km</div>` : ''}
+      </div>`).join('')}
+  </div>`;
+}
+
+/* ---------- 이름 일치 게이트 (프로토타입에서 검증된 규칙) ---------- */
+function normalizeForMatch(s) {
+  return String(s ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+function charBigrams(s) {
+  const out = new Set();
+  for (let i = 0; i + 1 < s.length; i++) out.add(s.slice(i, i + 2));
+  return out;
+}
+function bigramDice(a, b) {
+  if (a.length < 2 || b.length < 2) return a === b && a.length > 0 ? 1 : 0;
+  const ba = charBigrams(a);
+  const bb = charBigrams(b);
+  let shared = 0;
+  for (const g of ba) if (bb.has(g)) shared += 1;
+  return (2 * shared) / (ba.size + bb.size);
+}
+// CJK와 그 외 문자 덩어리를 나눠 따로 채점한다 ("Charlie Town 徐家汇中心店" 같은 혼합 이름 대응).
+function scriptRuns(s) {
+  const runs = [];
+  let cur = '';
+  let curKind = null;
+  for (const ch of String(s ?? '')) {
+    const kind = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(ch)
+      ? 'cjk' : 'other';
+    if (curKind !== null && kind !== curKind) { runs.push(cur); cur = ''; }
+    cur += ch;
+    curKind = kind;
+  }
+  if (cur) runs.push(cur);
+  return runs.map(normalizeForMatch).filter(r => r.length >= 2);
+}
+function nameRelevance(candidateName, targets) {
+  const cand = normalizeForMatch(candidateName);
+  if (!cand) return 0;
+  let best = 0;
+  for (const raw of targets) {
+    const target = normalizeForMatch(raw);
+    if (target.length < 2) continue;
+    if (cand.includes(target) || target.includes(cand)) return 1;
+    best = Math.max(best, bigramDice(cand, target));
+    const words = String(raw).toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u).map(normalizeForMatch).filter(w => w.length >= 3);
+    if (words.length >= 2) {
+      const hit = words.filter(w => cand.includes(w)).length;
+      best = Math.max(best, hit / words.length);
+    }
+    for (const run of scriptRuns(raw)) {
+      if (cand.includes(run) || run.includes(cand)) return 1;
+      best = Math.max(best, bigramDice(cand, run));
+    }
+  }
+  return best;
+}
+
+/* ---------- Nominatim 호출 (연속 호출 1.1초 간격) ---------- */
+let lastGeoCallAt = 0;
+async function nominatimSearch(q) {
+  const wait = 1100 - (Date.now() - lastGeoCallAt);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastGeoCallAt = Date.now();
+  const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1'
+    + '&limit=6&accept-language=ko&q=' + encodeURIComponent(q);
+  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error('위치 검색 실패 (' + res.status + ')');
+  return res.json();
+}
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// 거리 기준점: 이 여행에서 좌표가 연결된 '숙소' 카테고리 장소.
+function geoHotelRef() {
+  const h = state.places.find(p => p.category === '숙소' && placeHasLoc(p));
+  return h ? { lat: Number(h.lat), lng: Number(h.lng) } : null;
+}
+
+// 장소 이름에서 검색어 후보를 만든다. 괄호 안 중국어(예: 정안사(静安寺))는 따로도 검색한다.
+function geoNameVariants(place) {
+  const name = String(place.name || '').trim();
+  const variants = [name];
+  for (const m of name.matchAll(/[（(]([^）)]+)[）)]/g)) {
+    const inner = m[1].trim();
+    if (inner) variants.push(inner);
+  }
+  const stripped = name.replace(/[（(][^）)]*[）)]/g, '').trim();
+  if (stripped && stripped !== name) variants.push(stripped);
+  return [...new Set(variants.filter(v => v.length >= 2))];
+}
+
+async function findGeoCandidates(place, maxQueries = 4) {
+  const variants = geoNameVariants(place);
+  if (!variants.length) return [];
+  const dest = (state.trip?.destination || '').trim();
+  const queries = [];
+  for (const v of variants) {
+    if (dest) queries.push(`${v}, ${dest}`);
+    queries.push(v);
+  }
+  const qs = [...new Set(queries)].slice(0, maxQueries);
+  const hotel = geoHotelRef();
+  const selfIsHotel = hotel && placeHasLoc(place)
+    && Number(place.lat) === hotel.lat && Number(place.lng) === hotel.lng;
+  const byKey = new Map();
+  for (const q of qs) {
+    let hits = [];
+    try { hits = await nominatimSearch(q); } catch { hits = []; }
+    for (const h of hits) {
+      const lat = Number(h.lat);
+      const lng = Number(h.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+      if (byKey.has(key)) continue;
+      const candName = String(h.name || (h.display_name || '').split(',')[0] || '').trim();
+      if (!candName) continue;
+      const score = nameRelevance(candName, variants);
+      if (score < 0.5) continue; // 이름이 실제로 맞는 후보만 남긴다.
+      byKey.set(key, {
+        name: candName,
+        address: h.display_name || '',
+        lat, lng, score,
+        distanceKm: hotel && !selfIsHotel ? haversineKm(hotel.lat, hotel.lng, lat, lng) : null,
+      });
+    }
+    if (byKey.size >= 6) break;
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.score - a.score || (a.distanceKm ?? 1e9) - (b.distanceKm ?? 1e9))
+    .slice(0, 6);
+}
+
+async function startGeoSearch(placeId) {
+  const place = state.places.find(p => p.id === placeId);
+  if (!place) return;
+  geoState.status[placeId] = 'searching';
+  renderPlaces();
+  try {
+    geoState.cands[placeId] = await findGeoCandidates(place, 4);
+  } catch {
+    geoState.cands[placeId] = [];
+  }
+  geoState.status[placeId] = 'done';
+  renderPlaces();
+}
+
+// 위치 저장/해제. 컬럼이 아직 없으면 준비 안내를 띄운다.
+async function updatePlaceLocation(placeId, fields) {
+  const { error } = await sb.from('saved_places').update(fields).eq('id', placeId);
+  if (!error) return true;
+  if (error.code === 'PGRST204' || /column/i.test(error.message || '')) {
+    showError('위치 저장 준비가 아직 안 됐어요. saved_places에 위치 컬럼(lat, lng, address, matched_name)을 추가하는 SQL을 먼저 실행해 주세요.');
+  } else {
+    showError('위치 저장 실패: ' + error.message);
+  }
+  return false;
+}
+
+$('bulkGeoBtn').onclick = async () => {
+  const targets = state.places.filter(p => !placeHasLoc(p)).slice(0, 10);
+  const msg = $('bulkGeoMsg');
+  if (!targets.length) { msg.textContent = '모든 장소에 위치가 연결돼 있어요.'; return; }
+  const btn = $('bulkGeoBtn');
+  btn.disabled = true;
+  let linked = 0;
+  let skipped = 0;
+  try {
+    for (let i = 0; i < targets.length; i++) {
+      const place = targets[i];
+      msg.textContent = `위치 찾는 중... (${i + 1}/${targets.length}) ${place.name}`;
+      const cands = await findGeoCandidates(place, 2);
+      const top = cands[0];
+      // 후보가 하나뿐이거나 점수가 확실할 때만 자동 연결한다.
+      if (top && (cands.length === 1 || top.score >= 0.75)) {
+        const ok = await updatePlaceLocation(place.id, {
+          lat: top.lat, lng: top.lng, address: top.address, matched_name: top.name,
+        });
+        if (ok) { linked += 1; } else { skipped += 1; break; }
+      } else {
+        skipped += 1;
+      }
+    }
+  } finally {
+    btn.disabled = false;
+  }
+  msg.textContent = skipped
+    ? `${linked}개 연결, ${skipped}개는 직접 골라주세요.`
+    : `${linked}개 장소를 모두 연결했어요.`;
   await loadTripData();
 };
 
