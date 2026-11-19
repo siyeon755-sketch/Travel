@@ -1871,7 +1871,10 @@ async function addEnglishNames(
 //          그라운딩을 붙여 시도하고, 실패하면(원인 무관) 그라운딩
 //          없이 다시 시도한다.
 //   2단계: 각 제안을 Baidu 검색으로 조회해, 이름이 실제로
-//          일치하는 POI만 후보로 인정한다. 주소만 일치한 POI
+//          일치하는 POI만 후보로 인정한다. 이름 일치는 포함
+//          관계 외에 공통 접두 규칙(브랜드+업종 제안 vs 수식어가
+//          낀 실제 POI 이름)도 인정한다. 입력이 가게·브랜드인데
+//          제안이 일반 지명뿐이면 그 제안은 건너뛴다. 주소만 일치한 POI
 //          (같은 주소의 다른 입점 업체 등)는 이름 일치 후보가
 //          있으면 버리고, 이름 일치가 전혀 없을 때만 제안 주소
 //          문자열에 이름이 그대로 들어 있는 건물 POI 1개를
@@ -1979,13 +1982,32 @@ function parseResolveSuggestionText(text) {
   return list && list.length > 0 ? list[0] : null;
 }
 
-// 이름 일치: POI 이름의 핵심에 제안 현지명의 핵심이 들어 있거나 그 반대.
+// 두 문자열의 최장 공통 접두 길이.
+function commonPrefixLength(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
+}
+
+// 이름 일치: POI 이름의 핵심에 제안 현지명의 핵심이 들어 있거나
+// 그 반대. 추가로 접두 규칙도 인정한다: 제안이 "滇牛火锅"처럼
+// 브랜드+업종 형태인데 실제 POI는 "滇牛云南酸菜牛肉火锅"처럼
+// 중간에 수식어가 끼어 있으면 포함 관계가 성립하지 않는다. 이럴 때
+// 공통 접두가 2자 이상이고 짧은 쪽 길이의 절반 이상이면 같은
+// 브랜드로 본다. 이 규칙은 Baidu가 그 제안 이름으로 검색해 온
+// 결과 안에서만 적용되므로(호출부 구조), 무관한 장소까지 끌어올
+// 위험은 제한적이다. 예: 제안 "点都德" vs POI "点牛火锅"는 공통
+// 접두가 1자라 일치하지 않는다.
 function poiNameMatchesSuggestion(poi, suggestion) {
   if (!poi || !suggestion) return false;
   const poiCore = corePlaceName(poi.name);
   const sugCore = corePlaceName(suggestion.local_name);
   if (sugCore.length < 2 || !poiCore) return false;
-  return poiCore.includes(sugCore) || sugCore.includes(poiCore);
+  if (poiCore.includes(sugCore) || sugCore.includes(poiCore)) return true;
+  const prefix = commonPrefixLength(poiCore, sugCore);
+  const shorter = Math.min(poiCore.length, sugCore.length);
+  return prefix >= 2 && prefix * 2 >= shorter;
 }
 
 // 주소 일치: POI 주소에 제안 주소의 도로명+번지 토큰이 들어 있으면 일치.
@@ -2016,6 +2038,50 @@ function poiIsBuildingOfSuggestion(poi, suggestion) {
   return sugAddr.includes(poiCore);
 }
 
+// 일반 지명형 이름: 광장·공원·역·공항 같은 공공 지명으로 끝나는
+// 짧은 이름. 가게 이름이 아니라 지역 이름일 뿐이라, 브랜드를
+// 물었는데 이런 이름이 제안되면 그 장소 자체(예: 인민광장)를
+// 가게로 착각하게 된다.
+const GENERIC_PLACE_SUFFIXES = [
+  "广场", "公园", "车站", "火车站", "地铁站", "汽车站", "客运站",
+  "机场", "大桥", "桥", "码头", "港口", "体育场", "体育馆",
+  "博物馆", "图书馆", "纪念馆", "动物园", "植物园", "游乐园",
+  "大道", "大街", "街道", "路", "街",
+];
+
+function isGenericPlaceCore(core) {
+  if (!core || core.length > 6) return false;
+  return GENERIC_PLACE_SUFFIXES.some((s) => core.endsWith(s));
+}
+
+// 한국어 입력에 업종/브랜드 신호가 있는지: 카테고리 단어가 있거나
+// "~점"으로 끝나는 지점 표기가 있으면, 사용자가 가게·브랜드를
+// 찾고 있는 것으로 본다.
+const KOREAN_BUSINESS_HINTS = [
+  "훠궈", "화궈", "식당", "카페", "커피", "호텔", "레스토랑",
+  "음식점", "맛집", "베이커리", "빵집", "디저트", "술집", "주점",
+  "치킨", "피자", "스시", "초밥", "라멘", "우동", "국수", "분식",
+  "마라탕", "양꼬치", "딤섬", "서점", "약국", "마트", "백화점",
+  "쇼핑몰", "미용실", "노래방", "영화관",
+];
+
+function inputHasBusinessHint(name) {
+  const s = String(name ?? "");
+  if (KOREAN_BUSINESS_HINTS.some((h) => s.includes(h))) return true;
+  // 지점 표기: 글자 뒤에 "점"으로 끝나는 형태(예: 인민광장점).
+  return /[가-힣A-Za-z0-9]점\s*$/.test(s);
+}
+
+// 지명 답변 차단: 입력이 가게·브랜드를 가리키는데 제안 핵심이
+// 일반 지명뿐이면(예: "디안뉴 훠궈 인민광장점" → 제안 "人民广场")
+// 그 제안은 건너뛴다. 입력 자체가 지명인 경우(업종 신호 없음)는
+// 차단하지 않는다.
+function isLandmarkOnlySuggestion(inputName, suggestion) {
+  if (!suggestion) return false;
+  if (!inputHasBusinessHint(inputName)) return false;
+  return isGenericPlaceCore(corePlaceName(suggestion.local_name));
+}
+
 // resolve-place 본체. suggest(name, city)는 Gemini 제안 함수로,
 // 현지 이름 후보를 우선순위 순으로 최대 3개까지 돌려준다.
 // search(query)는 Baidu 검색 함수로 주입받는다(테스트에서 스텁 교체).
@@ -2026,6 +2092,8 @@ function poiIsBuildingOfSuggestion(poi, suggestion) {
 // POI 1개를 예외로 허용한다. resolved는 실제로 이름 일치로 검증된
 // 추측을 기준으로 하고(건물 예외만 성립하면 그 건물을 기준으로),
 // 먼저 검증된 추측이 있으면 뒤 추측은 더 조회하지 않는다.
+// 단, 입력이 가게·브랜드인데 제안이 일반 지명뿐인 경우는 그
+// 제안을 건너뛴다(지명 답변 차단, isLandmarkOnlySuggestion).
 async function resolvePlaceCore(name, city, suggest, search) {
   const outcome = await suggest(name, city);
   if (!outcome || outcome.status !== "ok") {
@@ -2045,14 +2113,20 @@ async function resolvePlaceCore(name, city, suggest, search) {
       ...(outcome?.error ? { ai_error: outcome.error } : {}),
     };
   }
-  const suggestions = (Array.isArray(outcome.suggestions)
+  const allSuggestions = (Array.isArray(outcome.suggestions)
     ? outcome.suggestions
     : [])
     .filter((s) => s && s.local_name)
     .slice(0, 3);
-  if (suggestions.length === 0) {
+  if (allSuggestions.length === 0) {
     return { ok: false, reason: "이 이름으로는 현지 이름을 찾지 못했어요." };
   }
+  // 지명 답변 차단: 가게·브랜드 입력인데 일반 지명만 제안한
+  // 후보는 검증 자체를 건너뛴다. 전부 이러면 아래에서 이름
+  // 일치 없이 ok:false로 떨어진다.
+  const suggestions = allSuggestions.filter(
+    (s) => !isLandmarkOnlySuggestion(name, s),
+  );
   let buildingFallback = null;
   for (const sug of suggestions) {
     const queries = [];
@@ -2166,6 +2240,7 @@ function buildResolvePrompt(name: string, city?: string): string {
   return `너는 중국 현지 장소 이름을 찾는 도우미다.
 한국어로 된 장소 이름이 주어지면, 그 장소의 중국 현지 정식 이름(간체자) 후보를 찾아라.
 한국어 표기는 중국어 병음 발음을 한국어로 옮긴 경우가 많다. 발음이 가장 가까운 간체자 표기를 첫 번째 후보로 하고, 발음이 비슷해 헷갈릴 수 있는 다른 표기가 있으면 최대 3개까지 후보를 제시해라.
+지점 표기(예: 인민광장점)에 들어 있는 광장·역·거리 같은 일반 지명을 장소 이름으로 제안하지 마라. 반드시 가게·브랜드의 정식 이름을 제안하고, 지점은 이름 뒤 괄호에 넣어라(예: "滇牛云南酸菜牛肉火锅(人民广场店)").
 각 후보에는 알면 중국어 주소와 영어 이름도 적어라(모르면 null).
 실제로 존재할 법한 이름만 제시해라. 전혀 모르겠으면 candidates를 빈 배열로 답해라.
 설명 없이 JSON 객체 하나만 출력해라. 형식: {"candidates": [{"local_name": "黛茂诗酒店", "address": "上海市黄浦区中华路1465号", "english_name": "Demores Hotel"}]}
