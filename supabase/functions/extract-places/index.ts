@@ -505,6 +505,97 @@ function extractCandidates(title, description, bodyText, options = {}) {
     .map((v) => ({ name: v.name, likely: !!v.likely }));
 }
 
+// === 제목 안전망: 제목의 대표 장소 ===
+// AI가 게시물의 주제인 장소를 건너뛰는 경우가 있다. 특히 제목에
+// 대문짝만하게 있는 식당을 빼먹는 사례가 실측으로 확인됐다
+// (제목 "상하이 디안뉴 훠궈 인민광장점, …" 인데 후보는 주변 역·
+// 거리뿐). 그래서 제목 첫 절에서 대표 장소를 규칙으로 뽑아 두고,
+// AI 후보에 비슷한 이름이 없을 때만 finalizeCandidates가 병합하는
+// 결정적 안전망으로 쓴다. 글당 최대 1개만 만든다.
+
+// 제목 앞머리에 붙는 도시/지역 접두 (공백으로 이어질 때만 제거한다.
+// "상하이타워"처럼 붙어 있는 고유명사는 건드리지 않는다)
+const TITLE_CITY_PREFIXES = [
+  "상하이", "상해", "베이징", "북경", "광저우", "선전", "심천",
+  "청두", "성도", "충칭", "중경", "시안", "서안", "항저우", "항주",
+  "난징", "남경", "쑤저우", "소주", "우한", "무한", "샤먼", "하문",
+  "창사", "장사", "톈진", "천진", "홍콩", "마카오",
+  "도쿄", "오사카", "교토", "후쿠오카", "삿포로", "나고야",
+  "서울", "부산", "제주", "인천", "대구", "광주", "대전", "울산",
+  "방콕", "치앙마이", "다낭", "하노이", "호치민", "나트랑",
+  "타이베이", "가오슝", "타이중",
+  "중국", "일본", "대만", "태국", "베트남", "한국",
+].sort((a, b) => b.length - a.length);
+
+// 장소 접미사: 끝에 붙으면 장소로 인정 (기존 규칙의 접미사 집합 확장)
+const TITLE_PLACE_SUFFIXES = [
+  "박물관", "미술관", "백화점", "공원", "시장", "광장", "타워",
+  "거리", "역", "사", "루", "몰", "랜드", "월드", "센터", "대교",
+  "호수", "사원", "성당", "궁전", "항", "섬", "산",
+  "점", "식당", "훠궈", "카페", "호텔", "로",
+];
+
+// 장소 접미사: 이름 중간에 있어도 장소로 인정하는 강한 것들만
+// ("로", "사" 같은 약한 접미사는 "브이로그" 같은 일반어를 통과시켜
+// 버리므로 포함 판정에서는 뺀다)
+const TITLE_STRONG_SUFFIXES = [
+  "박물관", "미술관", "백화점", "공원", "시장", "광장", "타워",
+  "거리", "역", "몰", "센터",
+  "점", "식당", "훠궈", "카페", "호텔",
+];
+
+// 이런 일반어가 섞인 구는 장소 이름이 아니다 (제목 낚시문구 차단)
+const TITLE_GENERIC_PHRASES = [
+  "추천", "후기", "브이로그", "여행", "코스", "일정", "투어",
+  "총정리", "리스트", "모음", "기록", "소개", "가이드", "꿀팁",
+];
+
+// 제목 안전망 후보의 카테고리를 이름 키워드로 추정한다.
+// (앱 카테고리 체계와 같은 값을 돌려준다)
+function guessTitleCandidateCategory(name) {
+  const checks = [
+    ["식사", ["훠궈", "식당", "레스토랑", "음식점", "맛집", "밥집", "국수", "라멘", "스시", "초밥"]],
+    ["카페", ["카페", "커피"]],
+    ["음료", ["밀크티", "버블티", "음료", "주스", "찻집"]],
+    ["디저트", ["디저트", "베이커리", "빵집", "제과", "아이스크림", "케이크"]],
+    ["숙소", ["호텔", "숙소", "민박", "게스트하우스", "료칸"]],
+    ["교통", ["역", "공항", "터미널", "정류장"]],
+    ["쇼핑", ["백화점", "몰", "상점", "아울렛", "면세점"]],
+    ["관광", ["박물관", "미술관", "공원", "시장", "테마파크", "수족관", "동물원"]],
+    ["명소", ["타워", "전망대", "랜드마크", "대교", "궁전", "성당", "사원"]],
+  ];
+  for (const [cat, kws] of checks) {
+    if (kws.some((k) => name.includes(k))) return cat;
+  }
+  return "기타";
+}
+
+// 제목에서 대표 장소 후보를 뽑는다. 없으면 null.
+//   1) 첫 절만 취한다 (쉼표·가운뎃점·대시·세로줄 앞부분)
+//   2) 도시/지역 접두를 벗긴다
+//   3) 장소 접미사로 끝나거나 강한 접미사를 포함할 때만 인정한다
+function titleSafetyNetCandidate(rawTitle) {
+  const title = String(rawTitle ?? "").trim();
+  if (!title) return null;
+  let head = cleanCandidate(title.split(/[,，·•|—–―-]/)[0]);
+  for (let i = 0; i < 2 && head; i++) {
+    const city = TITLE_CITY_PREFIXES.find((c) => head.startsWith(c + " "));
+    if (!city) break;
+    head = head.slice(city.length).trim();
+  }
+  if (!head) return null;
+  if (TITLE_GENERIC_PHRASES.some((w) => head.includes(w))) return null;
+  if (!isValidCandidate(head)) return null;
+  const placeLike = TITLE_PLACE_SUFFIXES.some((s) => head.endsWith(s)) ||
+    TITLE_STRONG_SUFFIXES.some((s) => head.includes(s));
+  if (!placeLike) return null;
+  return {
+    name: head,
+    likely: true,
+    category: guessTitleCandidateCategory(head),
+  };
+}
+
 // === SSRF 방지: 허용 사이트 제한 ===
 // 읽을 수 있는 호스트는 아래 목록뿐이다. 목록에 없으면 가져오지 않는다.
 const ALLOWED_HOSTS = new Set([
@@ -783,6 +874,8 @@ const AI_PROMPT_PREFIX =
 아래 여행 게시물 텍스트에서 실제로 방문할 수 있는 장소 이름(식당·카페·상점·관광지·호텔·랜드마크·역·시장 등)만 뽑아라.
 결제 브랜드(유니온페이·네이버페이·페이북 등), 플랫폼·앱 이름, 사람 이름, 계정명, 일반 명사, 장소가 아닌 해시태그는 제외해라.
 지점명이 있으면 지점까지 포함해라(예: 찰리타운 정안 캐리센터점).
+제목(텍스트 첫 줄)에 나온 장소는 반드시 포함해라. 제목에 있는 장소가 그 게시물의 주제인 경우가 많다.
+외국 장소 이름을 한국어로 음역한 표기(예: 디안뉴 훠궈 인민광장점)도 실제 장소 이름으로 보고 포함해라.
 중국어 이름에 한국어/영어 병기가 있으면 "한국어명(중국어명)"처럼 함께 적어라.
 category_guess는 다음 중 하나로 골라라: 음료, 식사, 디저트, 카페, 쇼핑, 관광, 명소, 숙소, 교통, 기타.
 설명 없이 JSON 배열만 출력해라. 형식: [{"name": "장소 이름", "category_guess": "식사"}]
@@ -987,6 +1080,7 @@ async function finalizeCandidates(opts: {
   rules: () => PlaceCandidate[];
   pinned?: string[];
   limit: number;
+  title?: string;
 }): Promise<{
   candidates: PlaceCandidate[];
   method: "ai" | "rules";
@@ -1004,6 +1098,24 @@ async function finalizeCandidates(opts: {
       if (seen.has(key)) continue;
       seen.add(key);
       merged.push({ name, likely: true });
+    }
+    // 제목 안전망: 제목의 대표 장소를 AI가 빼먹었으면 규칙 후보를
+    // likely로 병합한다. 이미 병합된 후보나 AI 후보와 이름이 겹치면
+    // (포함 관계) 중복이라 보고 넣지 않는다.
+    const safety = titleSafetyNetCandidate(opts.title);
+    if (safety) {
+      const sKey = safety.name.replace(/\s+/g, "").toLowerCase();
+      const overlaps = (name: string) => {
+        const k = name.replace(/\s+/g, "").toLowerCase();
+        return k.includes(sKey) || sKey.includes(k);
+      };
+      if (
+        !merged.some((c) => overlaps(c.name)) &&
+        !ai.candidates.some((c) => overlaps(c.name))
+      ) {
+        merged.push(safety);
+        seen.add(sKey);
+      }
     }
     for (const c of ai.candidates) {
       const key = c.name.replace(/\s+/g, "").toLowerCase();
@@ -1089,6 +1201,7 @@ async function extractNaverBlog(url: URL): Promise<ExtractResult> {
     aiText: [title, description, bodyText].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, bodyText),
     limit: 20,
+    title,
   });
   return {
     ok: true,
@@ -1132,6 +1245,7 @@ async function extractYouTube(url: URL): Promise<ExtractResult> {
     aiText: [title, description].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, description),
     limit: 20,
+    title,
   });
   return {
     ok: true,
@@ -1269,6 +1383,7 @@ async function extractInstagram(url: URL): Promise<ExtractResult> {
     // 위치 태그는 AI 경로에서는 pinned으로 맨 앞에 유지되고,
     // 규칙 경로에서는 아래 콜백이 기존처럼 병합한다.
     pinned: locations,
+    title: ogTitle,
     rules: () => {
       const list = extractCandidates(ogTitle, ogDescription, caption, {
         source: "instagram",
@@ -1322,6 +1437,7 @@ async function extractGeneric(url: URL): Promise<ExtractResult> {
     aiText: [title, description, bodyText].filter(Boolean).join("\n"),
     rules: () => extractCandidates(title, description, bodyText),
     limit: 20,
+    title,
   });
   return {
     ok: true,
