@@ -2791,6 +2791,12 @@ async function startBrandSearch(placeId) {
   renderRoute();
   let cands = [];
   try { cands = await findGeoCandidates(place, 4); } catch { cands = []; }
+  // 이름 후보가 없으면 한글 이름을 AI로 해석해 찾는 폴백도 시도한다
+  // (장소 카드 검색과 같은 경로. 중국 여행 + 한글 이름일 때만 동작하고,
+  //  resolve 후보는 여러 지점을 포함하므로 아래 동선 계산을 그대로 탄다).
+  if (!cands.length) {
+    try { cands = await findGeoByResolveFallback(place, place.name); } catch { cands = []; }
+  }
   if (!cands.length) {
     routeState.recs[placeId] = { status: 'none', modeDay };
     renderRoute();
