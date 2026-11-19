@@ -38,7 +38,8 @@
   }
   label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
   input[type="text"], input[type="email"], input[type="password"],
-  input[type="number"], input[type="date"], select, textarea {
+  input[type="number"], input[type="date"], input[type="datetime-local"],
+  select, textarea {
     width: 100%; padding: 10px 12px; border: 1px solid var(--line);
     border-radius: 10px; font-size: 15px; background: #fff; color: var(--text);
   }
@@ -215,6 +216,42 @@
 
     <!-- 일정 탭 -->
     <div id="tab-plan">
+      <div id="bookingList"></div>
+      <div class="card" id="bookingFormCard">
+        <h3 id="bkFormTitle">예약 추가</h3>
+        <label for="bkKind">유형</label>
+        <select id="bkKind">
+          <option>항공</option><option>기차</option><option>숙소</option><option>기타</option>
+        </select>
+        <label for="bkTitle" id="bkTitleLabel">편명</label>
+        <input type="text" id="bkTitle" placeholder="예: KE887">
+        <div id="bkFromWrap">
+          <label for="bkFrom" id="bkFromLabel">출발 공항</label>
+          <input type="text" id="bkFrom" placeholder="예: 인천">
+        </div>
+        <div id="bkToWrap">
+          <label for="bkTo" id="bkToLabel">도착 공항</label>
+          <input type="text" id="bkTo" placeholder="예: 상하이 푸둥">
+        </div>
+        <div id="bkAddrWrap" class="hidden">
+          <label for="bkAddress">주소</label>
+          <input type="text" id="bkAddress" placeholder="예: 상하이 황푸구 중화로 1465">
+        </div>
+        <div class="row">
+          <div>
+            <label for="bkStart" id="bkStartLabel">출발 일시</label>
+            <input type="datetime-local" id="bkStart">
+          </div>
+          <div>
+            <label for="bkEnd" id="bkEndLabel">도착 일시</label>
+            <input type="datetime-local" id="bkEnd">
+          </div>
+        </div>
+        <label for="bkMemo">메모</label>
+        <input type="text" id="bkMemo" placeholder="메모 (선택)">
+        <button id="bkSaveBtn" class="btn-block">예약 저장</button>
+        <button id="bkCancelBtn" class="btn-block secondary hidden">수정 취소</button>
+      </div>
       <div class="total-box">예상 총예산: <span id="planTotal">0원</span></div>
       <div id="planDays"></div>
       <div class="card">
@@ -474,6 +511,8 @@ const state = {
   members: [],         // 정산 멤버
   tripMembers: [],     // 계정 멤버
   planItems: [],
+  bookings: [],        // 예약 정보 (항공·기차·숙소·기타)
+  bookingsReady: true, // bookings 테이블이 없으면 false
   places: [],
   checklist: [],
   expenses: [],        // segments + participant_ids 포함
@@ -730,7 +769,15 @@ async function loadTripData() {
       participant_ids: (s.segment_shares || []).map(sh => sh.member_id),
     })),
   }));
-  renderPlan(); renderPlaces(); renderChecklist(); renderSettle(); renderShare();
+  // 예약 정보는 테이블이 아직 없을 수 있어 따로 조회한다(실패해도 앱은 계속 동작).
+  const bk = await sb.from('bookings').select('*').eq('trip_id', tid);
+  state.bookingsReady = !bk.error;
+  state.bookings = (bk.data || []).slice().sort((a, b) => {
+    const ta = a.start_at ? new Date(a.start_at).getTime() : Infinity;
+    const tb = b.start_at ? new Date(b.start_at).getTime() : Infinity;
+    return ta - tb;
+  });
+  renderBookings(); renderPlan(); renderPlaces(); renderChecklist(); renderSettle(); renderShare();
 }
 
 function setTab(tab) {
@@ -801,6 +848,307 @@ $('addPlanBtn').onclick = async () => {
   $('piTitle').value = ''; $('piMemo').value = ''; $('piTime').value = ''; $('piCost').value = '';
   await loadTripData();
 };
+
+/* ============================================================
+   예약 정보 (일정 탭 위쪽)
+   항공·기차·숙소·기타 예약을 시작 시각 순으로 보여 준다.
+   숙소 예약은 장소 위치 찾기와 같은 후보 검색으로 좌표를 연결할 수 있고,
+   연결된 숙소 좌표는 장소 후보의 거리 기준점으로 우선 쓰인다.
+   bookings 테이블이 없으면 안내만 표시하고 앱은 계속 동작한다.
+   ============================================================ */
+const BK_WEEK = ['일', '월', '화', '수', '목', '금', '토'];
+const BK_LABELS = {
+  '항공': { title: '편명', from: '출발 공항', to: '도착 공항', start: '출발 일시', end: '도착 일시', titlePh: '예: KE887' },
+  '기차': { title: '열차 번호', from: '출발역', to: '도착역', start: '출발 일시', end: '도착 일시', titlePh: '예: G1234' },
+  '숙소': { title: '숙소 이름', start: '체크인', end: '체크아웃', titlePh: '예: 데모레스 호텔' },
+  '기타': { title: '제목', from: '장소', start: '시작 일시', end: '종료 일시', titlePh: '예: 공항 픽업' },
+};
+let bkEditId = null;
+const bkGeoState = { cands: {}, status: {} }; // bookingId -> 후보 배열 / 진행 상태
+
+// "1. 18. (월) 11:10" 형식. 사용자 로컬 시간 기준.
+function fmtBkDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}. ${d.getDate()}. (${BK_WEEK[d.getDay()]}) ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// 시작~종료 한 줄 표기. 같은 날이면 종료는 시각만 보여 준다.
+function fmtBkRange(b) {
+  const s = fmtBkDateTime(b.start_at);
+  const e = fmtBkDateTime(b.end_at);
+  if (s && e) {
+    const sd = new Date(b.start_at);
+    const ed = new Date(b.end_at);
+    const sameDay = sd.getFullYear() === ed.getFullYear()
+      && sd.getMonth() === ed.getMonth() && sd.getDate() === ed.getDate();
+    if (sameDay) {
+      const p = n => String(n).padStart(2, '0');
+      return `${s} – ${p(ed.getHours())}:${p(ed.getMinutes())}`;
+    }
+    return `${s} – ${e}`;
+  }
+  return s || e || '';
+}
+// datetime-local 입력값으로 변환 (로컬 시간 기준).
+function toLocalInputValue(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function bkHasLoc(b) {
+  return b.lat != null && b.lng != null
+    && Number.isFinite(Number(b.lat)) && Number.isFinite(Number(b.lng));
+}
+
+// 카드 둘째 줄: 구간 + 일시를 한 줄로.
+function bookingLine(b) {
+  const range = fmtBkRange(b);
+  if (b.kind === '숙소') {
+    return [b.address, range].filter(Boolean).join(' · ');
+  }
+  if (b.kind === '기타') {
+    return [b.from_text, range].filter(Boolean).join(' · ');
+  }
+  const route = (b.from_text || b.to_text)
+    ? `${b.from_text || '?'} → ${b.to_text || '?'}` : '';
+  return [route, range].filter(Boolean).join(' · ');
+}
+
+function bkLocHtml(b) {
+  let html = '';
+  if (bkHasLoc(b)) {
+    html += `<div style="margin-top:10px">
+      <span class="ok-msg">📍 위치 연결됨</span>
+      ${b.address ? `<div class="muted oneline" title="${esc(b.address)}">${esc(b.address)}</div>` : ''}
+      <div class="row" style="margin-top:8px">
+        <a class="btn-link" href="${esc(mapSearchUrl(b.title))}" target="_blank" rel="noopener noreferrer">지도에서 보기</a>
+        <button class="secondary" data-bk-geo-search="${b.id}" style="flex:0 0 auto">위치 다시 찾기</button>
+        <button class="danger" data-bk-geo-clear="${b.id}" style="flex:0 0 auto">연결 해제</button>
+      </div>
+    </div>`;
+  } else {
+    html += `<div style="margin-top:10px">
+      <button class="secondary small" data-bk-geo-search="${b.id}">📍 숙소 위치 찾기</button>
+    </div>`;
+  }
+  return html + bkGeoCandsHtml(b);
+}
+
+function bkGeoCandsHtml(b) {
+  if (bkGeoState.status[b.id] === 'searching') {
+    return '<p class="muted" style="margin-top:8px">위치를 찾는 중...</p>';
+  }
+  const cands = bkGeoState.cands[b.id];
+  if (!cands) return '';
+  if (!cands.length) {
+    return `<div style="margin-top:8px">
+      <p class="muted">후보를 찾지 못했어요. 지도에서 직접 찾아보세요.</p>
+      <a class="btn-link" href="${esc(mapSearchUrl(b.title))}" target="_blank" rel="noopener noreferrer">지도에서 찾기</a>
+    </div>`;
+  }
+  return `<div style="margin-top:8px">
+    <div class="muted">맞는 위치를 골라 주세요.</div>
+    ${cands.map((c, i) => `
+      <div class="geo-cand" data-bk-geo-pick="${b.id}:${i}">
+        <div class="item-title">${esc(c.name)}</div>
+        ${c.region ? `<div class="geo-region">${esc(c.region)}</div>` : ''}
+        <div class="muted oneline" title="${esc(c.address)}">${esc(c.address)}</div>
+        ${c.distanceKm != null ? `<span class="geo-dist">숙소에서 약 ${c.distanceKm.toFixed(1)}km</span>` : ''}
+      </div>`).join('')}
+  </div>`;
+}
+
+function renderBookings() {
+  const box = $('bookingList');
+  if (!state.bookingsReady) {
+    box.innerHTML = '<div class="warn">예약 정보 준비가 아직 안 됐어요. bookings 테이블을 만드는 SQL을 먼저 실행해 주세요.</div>';
+    $('bookingFormCard').classList.add('hidden');
+    return;
+  }
+  $('bookingFormCard').classList.remove('hidden');
+  if (!state.bookings.length) {
+    box.innerHTML = '<div class="empty" style="margin-bottom:12px">아직 예약 정보가 없습니다.<br>항공편·기차·숙소를 아래에서 추가해 보세요.</div>';
+    return;
+  }
+  box.innerHTML = state.bookings.map(b => `
+    <div class="card">
+      <div class="item-line" style="border:0;padding:0">
+        <div class="item-main">
+          <div class="item-title"><span class="chip">${esc(b.kind)}</span>${esc(b.title || '(제목 없음)')}</div>
+          <div class="muted">${esc(bookingLine(b))}</div>
+          ${b.memo ? `<div class="muted">${esc(b.memo)}</div>` : ''}
+        </div>
+        <div style="display:flex;gap:6px;flex:0 0 auto">
+          <button class="secondary small" data-bk-edit="${b.id}">수정</button>
+          <button class="danger small" data-bk-del="${b.id}">삭제</button>
+        </div>
+      </div>
+      ${b.kind === '숙소' ? bkLocHtml(b) : ''}
+    </div>`).join('');
+  box.querySelectorAll('[data-bk-edit]').forEach(btn => {
+    btn.onclick = () => {
+      const b = state.bookings.find(x => x.id === btn.dataset.bkEdit);
+      if (b) fillBkForm(b);
+    };
+  });
+  box.querySelectorAll('[data-bk-del]').forEach(btn => {
+    btn.onclick = async () => {
+      const { error } = await sb.from('bookings').delete().eq('id', btn.dataset.bkDel);
+      if (error) { showError('예약 삭제 실패: ' + error.message); return; }
+      if (bkEditId === btn.dataset.bkDel) resetBkForm();
+      await loadTripData();
+    };
+  });
+  box.querySelectorAll('[data-bk-geo-search]').forEach(btn => {
+    btn.onclick = () => startBkGeoSearch(btn.dataset.bkGeoSearch);
+  });
+  box.querySelectorAll('[data-bk-geo-clear]').forEach(btn => {
+    btn.onclick = async () => {
+      const ok = await updateBookingLocation(btn.dataset.bkGeoClear,
+        { lat: null, lng: null });
+      if (ok) {
+        delete bkGeoState.cands[btn.dataset.bkGeoClear];
+        delete bkGeoState.status[btn.dataset.bkGeoClear];
+        await loadTripData();
+      }
+    };
+  });
+  box.querySelectorAll('[data-bk-geo-pick]').forEach(el => {
+    el.onclick = async () => {
+      const [bid, idx] = el.dataset.bkGeoPick.split(':');
+      const cand = (bkGeoState.cands[bid] || [])[Number(idx)];
+      if (!cand) return;
+      const ok = await updateBookingLocation(bid, {
+        lat: cand.lat, lng: cand.lng, address: cand.address,
+      });
+      if (ok) {
+        delete bkGeoState.cands[bid];
+        delete bkGeoState.status[bid];
+        await loadTripData();
+      }
+    };
+  });
+}
+
+/* ---------- 예약 폼 ---------- */
+function setBkKind(kind) {
+  const L = BK_LABELS[kind] || BK_LABELS['기타'];
+  $('bkTitleLabel').textContent = L.title;
+  $('bkTitle').placeholder = L.titlePh || '';
+  $('bkStartLabel').textContent = L.start;
+  $('bkEndLabel').textContent = L.end;
+  const isHotel = kind === '숙소';
+  const isEtc = kind === '기타';
+  $('bkFromWrap').classList.toggle('hidden', isHotel);
+  $('bkToWrap').classList.toggle('hidden', isHotel || isEtc);
+  $('bkAddrWrap').classList.toggle('hidden', !isHotel);
+  if (!isHotel) $('bkFromLabel').textContent = L.from;
+  if (!isHotel && !isEtc) $('bkToLabel').textContent = L.to;
+}
+$('bkKind').onchange = () => setBkKind($('bkKind').value);
+
+function fillBkForm(b) {
+  bkEditId = b.id;
+  $('bkKind').value = b.kind;
+  setBkKind(b.kind);
+  $('bkTitle').value = b.title || '';
+  $('bkFrom').value = b.from_text || '';
+  $('bkTo').value = b.to_text || '';
+  $('bkAddress').value = b.address || '';
+  $('bkStart').value = toLocalInputValue(b.start_at);
+  $('bkEnd').value = toLocalInputValue(b.end_at);
+  $('bkMemo').value = b.memo || '';
+  $('bkFormTitle').textContent = '예약 수정';
+  $('bkSaveBtn').textContent = '수정 저장';
+  $('bkCancelBtn').classList.remove('hidden');
+  $('bookingFormCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function resetBkForm() {
+  bkEditId = null;
+  $('bkKind').value = '항공';
+  setBkKind('항공');
+  $('bkTitle').value = ''; $('bkFrom').value = ''; $('bkTo').value = '';
+  $('bkAddress').value = ''; $('bkStart').value = ''; $('bkEnd').value = '';
+  $('bkMemo').value = '';
+  $('bkFormTitle').textContent = '예약 추가';
+  $('bkSaveBtn').textContent = '예약 저장';
+  $('bkCancelBtn').classList.add('hidden');
+}
+$('bkCancelBtn').onclick = () => resetBkForm();
+
+$('bkSaveBtn').onclick = async () => {
+  if (!state.bookingsReady) {
+    showError('예약 정보 준비가 아직 안 됐어요. bookings 테이블을 만드는 SQL을 먼저 실행해 주세요.');
+    return;
+  }
+  const kind = $('bkKind').value;
+  const title = $('bkTitle').value.trim();
+  if (!title) { showError(`${BK_LABELS[kind].title}을(를) 입력하세요.`); return; }
+  const startV = $('bkStart').value;
+  const endV = $('bkEnd').value;
+  if (startV && endV && new Date(endV) < new Date(startV)) {
+    showError('종료 일시가 시작 일시보다 빠릅니다.');
+    return;
+  }
+  showError('');
+  const payload = {
+    trip_id: state.trip.id,
+    kind,
+    title,
+    from_text: kind === '숙소' ? '' : $('bkFrom').value.trim(),
+    to_text: (kind === '숙소' || kind === '기타') ? '' : $('bkTo').value.trim(),
+    address: kind === '숙소' ? $('bkAddress').value.trim() : '',
+    start_at: startV ? new Date(startV).toISOString() : null,
+    end_at: endV ? new Date(endV).toISOString() : null,
+    memo: $('bkMemo').value.trim(),
+  };
+  let error;
+  if (bkEditId) {
+    // 숙소가 아닌 유형으로 바꾸면 예전 숙소 좌표는 남기지 않는다.
+    if (kind !== '숙소') { payload.lat = null; payload.lng = null; }
+    ({ error } = await sb.from('bookings').update(payload).eq('id', bkEditId));
+  } else {
+    ({ error } = await sb.from('bookings')
+      .insert({ ...payload, created_by: state.user.id }));
+  }
+  if (error) { showError('예약 저장 실패: ' + error.message); return; }
+  resetBkForm();
+  await loadTripData();
+};
+setBkKind('항공');
+
+/* ---------- 숙소 예약 위치 찾기 ---------- */
+async function startBkGeoSearch(bkId) {
+  const bk = state.bookings.find(b => b.id === bkId);
+  if (!bk) return;
+  bkGeoState.status[bkId] = 'searching';
+  renderBookings();
+  try {
+    bkGeoState.cands[bkId] = await findBookingGeoCandidates(bk);
+  } catch {
+    bkGeoState.cands[bkId] = [];
+  }
+  bkGeoState.status[bkId] = 'done';
+  renderBookings();
+}
+
+// 숙소 예약 위치 저장/해제.
+async function updateBookingLocation(bkId, fields) {
+  const { error } = await sb.from('bookings').update(fields).eq('id', bkId);
+  if (!error) return true;
+  if (error.code === 'PGRST204' || /column|bookings/i.test(error.message || '')) {
+    showError('예약 정보 준비가 아직 안 됐어요. bookings 테이블을 만드는 SQL을 먼저 실행해 주세요.');
+  } else {
+    showError('숙소 위치 저장 실패: ' + error.message);
+  }
+  return false;
+}
 
 /* ============================================================
    장소 보관함 탭
@@ -1053,8 +1401,13 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// 거리 기준점: 이 여행에서 좌표가 연결된 '숙소' 카테고리 장소.
+// 거리 기준점: 예약 정보의 숙소(좌표가 연결된 것)를 먼저 보고,
+// 없으면 이 여행에서 좌표가 연결된 '숙소' 카테고리 장소.
 function geoHotelRef() {
+  const bk = (state.bookings || []).find(b =>
+    b.kind === '숙소' && b.lat != null && b.lng != null
+    && Number.isFinite(Number(b.lat)) && Number.isFinite(Number(b.lng)));
+  if (bk) return { lat: Number(bk.lat), lng: Number(bk.lng) };
   const h = state.places.find(p => p.category === '숙소' && placeHasLoc(p));
   return h ? { lat: Number(h.lat), lng: Number(h.lng) } : null;
 }
@@ -1134,6 +1487,49 @@ function geoNameVariants(place) {
   return [...new Set(variants.filter(v => v.length >= 2))];
 }
 
+// 후보 수집 컨텍스트: 거리 기준점(숙소), 도시 필터, 자기 자신이 숙소인지.
+function geoHitCtx(refPlace) {
+  const hotel = geoHotelRef();
+  const city = geoTripCity();
+  const selfIsHotel = !!(hotel && refPlace && placeHasLoc(refPlace)
+    && Number(refPlace.lat) === hotel.lat && Number(refPlace.lng) === hotel.lng);
+  return { hotel, city, selfIsHotel };
+}
+
+// Nominatim 결과 하나를 게이트(이름 일치·도시·거리)에 통과하면 후보 맵에 넣는다.
+function geoAddHit(byKey, h, variants, ctx) {
+  const lat = Number(h.lat);
+  const lng = Number(h.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+  if (byKey.has(key)) return;
+  const candName = String(h.name || (h.display_name || '').split(',')[0] || '').trim();
+  if (!candName) return;
+  const score = nameRelevance(candName, variants);
+  if (score < 0.5) return; // 이름이 실제로 맞는 후보만 남긴다.
+  if (!geoCandInCity(h, ctx.city)) return; // 다른 도시의 동명 지점은 제외한다.
+  const distKm = ctx.hotel ? haversineKm(ctx.hotel.lat, ctx.hotel.lng, lat, lng) : null;
+  if (distKm != null && distKm > 60) return; // 숙소에서 너무 먼 후보는 제외한다.
+  byKey.set(key, {
+    name: candName,
+    address: h.display_name || '',
+    region: geoRegionLabel(h),
+    lat, lng, score,
+    distanceKm: ctx.selfIsHotel ? null : distKm,
+    sortDistKm: distKm,
+  });
+}
+
+function geoSortCands(list, hotel) {
+  if (hotel) {
+    // 숙소가 있으면 가까운 후보부터. 동거리면 이름 점수 높은 순.
+    list.sort((a, b) => (a.sortDistKm ?? 1e9) - (b.sortDistKm ?? 1e9) || b.score - a.score);
+  } else {
+    list.sort((a, b) => b.score - a.score || (a.distanceKm ?? 1e9) - (b.distanceKm ?? 1e9));
+  }
+  return list.slice(0, 6);
+}
+
 async function findGeoCandidates(place, maxQueries = 4) {
   const variants = geoNameVariants(place);
   if (!variants.length) return [];
@@ -1144,46 +1540,37 @@ async function findGeoCandidates(place, maxQueries = 4) {
     queries.push(v);
   }
   const qs = [...new Set(queries)].slice(0, maxQueries);
-  const hotel = geoHotelRef();
-  const city = geoTripCity();
-  const selfIsHotel = hotel && placeHasLoc(place)
-    && Number(place.lat) === hotel.lat && Number(place.lng) === hotel.lng;
+  const ctx = geoHitCtx(place);
   const byKey = new Map();
   for (const q of qs) {
     let hits = [];
     try { hits = await nominatimSearch(q); } catch { hits = []; }
-    for (const h of hits) {
-      const lat = Number(h.lat);
-      const lng = Number(h.lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
-      const key = lat.toFixed(5) + ',' + lng.toFixed(5);
-      if (byKey.has(key)) continue;
-      const candName = String(h.name || (h.display_name || '').split(',')[0] || '').trim();
-      if (!candName) continue;
-      const score = nameRelevance(candName, variants);
-      if (score < 0.5) continue; // 이름이 실제로 맞는 후보만 남긴다.
-      if (!geoCandInCity(h, city)) continue; // 다른 도시의 동명 지점은 제외한다.
-      const distKm = hotel ? haversineKm(hotel.lat, hotel.lng, lat, lng) : null;
-      if (distKm != null && distKm > 60) continue; // 숙소에서 너무 먼 후보는 제외한다.
-      byKey.set(key, {
-        name: candName,
-        address: h.display_name || '',
-        region: geoRegionLabel(h),
-        lat, lng, score,
-        distanceKm: selfIsHotel ? null : distKm,
-        sortDistKm: distKm,
-      });
-    }
+    for (const h of hits) geoAddHit(byKey, h, variants, ctx);
     if (byKey.size >= 6) break;
   }
-  const list = [...byKey.values()];
-  if (hotel) {
-    // 숙소가 있으면 가까운 후보부터. 동거리면 이름 점수 높은 순.
-    list.sort((a, b) => (a.sortDistKm ?? 1e9) - (b.sortDistKm ?? 1e9) || b.score - a.score);
-  } else {
-    list.sort((a, b) => b.score - a.score || (a.distanceKm ?? 1e9) - (b.distanceKm ?? 1e9));
+  return geoSortCands([...byKey.values()], ctx.hotel);
+}
+
+// 숙소 예약용 후보 검색: 저장 장소와 같은 게이트·도시/거리 필터를 공유하고,
+// 저장 대상만 bookings로 다르다. 이름으로 못 찾으면 주소로도 검색해 본다
+// (게이트 판정은 숙소 이름 기준).
+async function findBookingGeoCandidates(bk) {
+  const ref = { name: bk.title, lat: bk.lat, lng: bk.lng };
+  const cands = await findGeoCandidates(ref, 4);
+  if (cands.length || !bk.address) return cands;
+  const variants = geoNameVariants(ref);
+  if (!variants.length) return cands;
+  const ctx = geoHitCtx(ref);
+  const byKey = new Map();
+  const dest = (state.trip?.destination || '').trim();
+  const qs = dest ? [`${bk.address}, ${dest}`, bk.address] : [bk.address];
+  for (const q of qs) {
+    let hits = [];
+    try { hits = await nominatimSearch(q); } catch { hits = []; }
+    for (const h of hits) geoAddHit(byKey, h, variants, ctx);
+    if (byKey.size) break;
   }
-  return list.slice(0, 6);
+  return geoSortCands([...byKey.values()], ctx.hotel);
 }
 
 async function startGeoSearch(placeId) {
