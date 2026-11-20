@@ -895,11 +895,83 @@ function planOrderCmp(a, b) {
   return 0;
 }
 
+// 수정 중인 일정 항목 id. 그 항목 자리에는 인라인 수정 폼이 열린다.
+let planEditId = null;
+
+// 일정 항목 수정 폼(항목 자리에 인라인으로 열린다).
+function planEditFormHtml(p, n) {
+  const dayOptions = Array.from({ length: n }, (_, i) =>
+    `<option value="${i}"${i === p.day_index ? ' selected' : ''}>${dayLabel(state.trip, i)}</option>`).join('');
+  return `
+    <div data-plan-edit="${p.id}" style="padding:10px 0;border-bottom:1px solid var(--border)">
+      <label>날짜</label>
+      <select data-pe-day>${dayOptions}</select>
+      <label>시간</label>
+      <input type="text" data-pe-time value="${esc(p.time_text || '')}" placeholder="예: 10:00">
+      <label>장소/제목</label>
+      <input type="text" data-pe-title value="${esc(p.title)}">
+      <label>메모</label>
+      <input type="text" data-pe-memo value="${esc(p.memo || '')}" placeholder="메모 (선택)">
+      <div class="row" style="margin-top:10px">
+        <button data-pe-save="${p.id}">저장</button>
+        <button type="button" class="secondary" data-pe-cancel>취소</button>
+      </div>
+    </div>`;
+}
+
+// 일정 수정 저장. 날짜가 그대로면 sort_order는 건드리지 않는다(기존 순서 유지).
+// 날짜를 옮기면 대상 날짜의 기존 항목을 지금 보이는 순서대로 0부터 확정하고
+// 옮긴 항목은 그 뒤(최대값+1)에 붙인다 — addPickedPlaces와 같은 방식.
+// sort_order 컬럼이 없으면 순서 없이 저장하고 표시 순서는 created_at을 따른다.
+async function savePlanEdit(id) {
+  const item = state.planItems.find(p => p.id === id);
+  if (!item) { planEditId = null; renderPlan(); return; }
+  const form = document.querySelector(`[data-plan-edit="${id}"]`);
+  if (!form) return;
+  const title = form.querySelector('[data-pe-title]').value.trim();
+  if (!title) { showError('일정 제목을 입력하세요.'); return; }
+  const newDay = Number(form.querySelector('[data-pe-day]').value);
+  const payload = {
+    title,
+    time_text: form.querySelector('[data-pe-time]').value.trim(),
+    memo: form.querySelector('[data-pe-memo]').value.trim(),
+    day_index: newDay,
+  };
+  showError('');
+  let noSortCol = false;
+  if (newDay !== item.day_index) {
+    const targets = state.planItems
+      .filter(p => p.day_index === newDay && p.id !== id)
+      .sort(planOrderCmp);
+    for (let i = 0; i < targets.length; i++) {
+      if (targets[i].sort_order === i) continue;
+      const { error } = await sb.from('plan_items')
+        .update({ sort_order: i }).eq('id', targets[i].id);
+      if (error) {
+        if (error.code === 'PGRST204' || /column/i.test(error.message || '')) { noSortCol = true; break; }
+        showError('일정 수정 실패: ' + error.message);
+        return;
+      }
+    }
+    if (!noSortCol) payload.sort_order = targets.length;
+  }
+  let { error } = await sb.from('plan_items').update(payload).eq('id', id);
+  if (error && payload.sort_order != null
+    && (error.code === 'PGRST204' || /sort_order/.test(error.message || ''))) {
+    delete payload.sort_order;
+    ({ error } = await sb.from('plan_items').update(payload).eq('id', id));
+  }
+  if (error) { showError('일정 수정 실패: ' + error.message); return; }
+  planEditId = null;
+  await loadTripData();
+}
+
 function renderPlan() {
   const trip = state.trip;
   const n = dayCount(trip);
   $('piDay').innerHTML = Array.from({ length: n }, (_, i) =>
     `<option value="${i}">${dayLabel(trip, i)}</option>`).join('');
+  if (planEditId && !state.planItems.some(p => p.id === planEditId)) planEditId = null;
 
   let total = 0;
   state.planItems.forEach(p => { total += Number(p.expected_cost) || 0; });
@@ -913,22 +985,35 @@ function renderPlan() {
     if (!items.length) {
       html += '<div class="empty" style="padding:14px">아직 일정이 없습니다.</div>';
     } else {
-      html += '<div class="card">' + items.map(p => `
+      html += '<div class="card">' + items.map(p => planEditId === p.id ? planEditFormHtml(p, n) : `
         <div class="item-line">
           <div class="item-main">
             <div class="item-title">${p.time_text ? esc(p.time_text) + ' · ' : ''}${esc(p.title)}</div>
             <div class="muted">${esc(p.memo || '')}${p.expected_cost ? ` · 예상 ${fmt(p.expected_cost)}` : ''}</div>
           </div>
-          <button class="danger small" data-del-plan="${p.id}">삭제</button>
+          <div style="display:flex;gap:6px;flex:0 0 auto">
+            <button class="secondary small" data-edit-plan="${p.id}">수정</button>
+            <button class="danger small" data-del-plan="${p.id}">삭제</button>
+          </div>
         </div>`).join('') + '</div>';
     }
   }
   box.innerHTML = html;
   box.querySelectorAll('[data-del-plan]').forEach(b => {
     b.onclick = async () => {
+      if (planEditId === b.dataset.delPlan) planEditId = null;
       await sb.from('plan_items').delete().eq('id', b.dataset.delPlan);
       await loadTripData();
     };
+  });
+  box.querySelectorAll('[data-edit-plan]').forEach(b => {
+    b.onclick = () => { planEditId = b.dataset.editPlan; showError(''); renderPlan(); };
+  });
+  box.querySelectorAll('[data-pe-cancel]').forEach(b => {
+    b.onclick = () => { planEditId = null; showError(''); renderPlan(); };
+  });
+  box.querySelectorAll('[data-pe-save]').forEach(b => {
+    b.onclick = () => savePlanEdit(b.dataset.peSave);
   });
 }
 
