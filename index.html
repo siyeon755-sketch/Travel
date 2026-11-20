@@ -912,6 +912,8 @@ function planEditFormHtml(p, n) {
       <input type="text" data-pe-title value="${esc(p.title)}">
       <label>메모</label>
       <input type="text" data-pe-memo value="${esc(p.memo || '')}" placeholder="메모 (선택)">
+      <label>예상 비용 (원)</label>
+      <input type="number" data-pe-cost min="0" value="${Number(p.expected_cost) || 0}" placeholder="0">
       <div class="row" style="margin-top:10px">
         <button data-pe-save="${p.id}">저장</button>
         <button type="button" class="secondary" data-pe-cancel>취소</button>
@@ -935,6 +937,7 @@ async function savePlanEdit(id) {
     title,
     time_text: form.querySelector('[data-pe-time]').value.trim(),
     memo: form.querySelector('[data-pe-memo]').value.trim(),
+    expected_cost: Number(form.querySelector('[data-pe-cost]').value) || 0,
     day_index: newDay,
   };
   showError('');
